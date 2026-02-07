@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 import signal
 import shutil
 import subprocess
@@ -10,6 +11,9 @@ import time
 from pathlib import Path
 import pwd
 import ctypes
+import urllib.error
+import urllib.parse
+import urllib.request
 
 UDEV_RULE_PATH = "/etc/udev/rules.d/50-hyperxalpha.rules"
 UDEV_RULE_LINES = [
@@ -38,12 +42,246 @@ RUNTIME_MODULE_FILES = (
     "view.py",
 )
 RUNTIME_RESOURCE_DIRS = ("assets",)
+GITHUB_DEFAULT_REPO = "Darayavaush-84/HyperxAlpha"
+GITHUB_RELEASES_PER_PAGE = 10
+GITHUB_MAX_CHANGELOG_RELEASES = 3
+GITHUB_MAX_CHANGELOG_LINES = 10
+_SEMVER_RE = re.compile(r"^[vV]?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
 
 
 def _source_python_modules(source_package_dir):
     return sorted(
         path.name for path in source_package_dir.glob("*.py") if path.is_file()
     )
+
+
+def _extract_github_repo(remote_url):
+    if not remote_url:
+        return None
+    candidate = str(remote_url).strip()
+    if not candidate:
+        return None
+    patterns = (
+        r"^https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$",
+        r"^git@github\.com:([^/]+)/([^/]+?)(?:\.git)?$",
+        r"^ssh://git@github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$",
+    )
+    for pattern in patterns:
+        matched = re.match(pattern, candidate)
+        if matched:
+            owner, repo = matched.groups()
+            return f"{owner}/{repo}"
+    return None
+
+
+def _resolve_github_repo():
+    from_env = os.environ.get("HYPERX_GITHUB_REPO", "").strip()
+    if from_env:
+        return from_env
+
+    git_config_path = Path(__file__).resolve().parent / ".git" / "config"
+    try:
+        content = git_config_path.read_text(encoding="utf-8")
+    except OSError:
+        return GITHUB_DEFAULT_REPO
+
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped.lower().startswith("url ="):
+            continue
+        _key, raw_url = stripped.split("=", 1)
+        parsed = _extract_github_repo(raw_url.strip())
+        if parsed:
+            return parsed
+    return GITHUB_DEFAULT_REPO
+
+
+def _read_local_version():
+    init_path = SOURCE_PACKAGE_DIR / "__init__.py"
+    try:
+        content = init_path.read_text(encoding="utf-8")
+    except OSError:
+        return "0.0.0"
+    matched = re.search(r"__version__\s*=\s*['\"]([^'\"]+)['\"]", content)
+    if not matched:
+        return "0.0.0"
+    return matched.group(1).strip()
+
+
+def _parse_semver(version):
+    if not isinstance(version, str):
+        return None
+    matched = _SEMVER_RE.match(version.strip())
+    if not matched:
+        return None
+    return tuple(int(part) for part in matched.groups())
+
+
+def _fetch_github_releases(repo, per_page=GITHUB_RELEASES_PER_PAGE):
+    safe_repo = urllib.parse.quote(repo, safe="/")
+    safe_page = max(1, int(per_page))
+    url = (
+        f"https://api.github.com/repos/{safe_repo}/releases"
+        f"?per_page={safe_page}"
+    )
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "hyperxalpha-installer",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5.0) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as exc:
+        return None, f"GitHub API HTTP {exc.code}"
+    except urllib.error.URLError as exc:
+        return None, f"GitHub API unreachable: {exc.reason}"
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return None, f"Invalid GitHub API response: {exc}"
+
+    if not isinstance(payload, list):
+        return None, "Unexpected GitHub API payload."
+    return payload, None
+
+
+def _collect_stable_semver_releases(payload):
+    releases = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        if item.get("draft") or item.get("prerelease"):
+            continue
+        tag_name = str(item.get("tag_name") or "").strip()
+        version_tuple = _parse_semver(tag_name)
+        if version_tuple is None:
+            continue
+        releases.append(
+            {
+                "tag_name": tag_name,
+                "version_tuple": version_tuple,
+                "name": str(item.get("name") or "").strip(),
+                "body": str(item.get("body") or ""),
+                "published_at": str(item.get("published_at") or ""),
+                "html_url": str(item.get("html_url") or "").strip(),
+            }
+        )
+    return sorted(releases, key=lambda entry: entry["version_tuple"], reverse=True)
+
+
+def _newer_releases(local_version, releases):
+    local_tuple = _parse_semver(local_version)
+    if local_tuple is None:
+        return []
+    return [
+        entry for entry in releases if entry.get("version_tuple") and entry["version_tuple"] > local_tuple
+    ]
+
+
+def _format_release_date(published_at):
+    if not isinstance(published_at, str):
+        return "unknown-date"
+    text = published_at.strip()
+    if len(text) >= 10:
+        return text[:10]
+    return text or "unknown-date"
+
+
+def _normalize_changelog_line(text):
+    line = str(text).strip()
+    if not line:
+        return ""
+    line = re.sub(r"^#{1,6}\s*", "", line)
+    line = re.sub(r"`([^`]+)`", r"\1", line)
+    line = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", line)
+    if line.startswith(("- ", "* ", "+ ")):
+        return "- " + line[2:].strip()
+    if re.match(r"^\d+\.\s+", line):
+        return line
+    return "- " + line
+
+
+def _release_changelog_lines(body, max_lines=GITHUB_MAX_CHANGELOG_LINES):
+    lines = []
+    truncated = False
+    for raw_line in str(body).splitlines():
+        normalized = _normalize_changelog_line(raw_line)
+        if not normalized:
+            continue
+        lines.append(normalized)
+        if len(lines) >= max(1, int(max_lines)):
+            truncated = True
+            break
+    if not lines:
+        return ["- No changelog details provided."]
+    if truncated:
+        lines.append("- ...")
+    return lines
+
+
+def _format_update_changelog(releases):
+    if not releases:
+        return "No newer release notes available."
+    shown = releases[: max(1, int(GITHUB_MAX_CHANGELOG_RELEASES))]
+    output = []
+    for release in shown:
+        header = f"{release['tag_name']} ({_format_release_date(release.get('published_at'))})"
+        release_name = release.get("name", "")
+        if release_name and release_name != release["tag_name"]:
+            header += f" - {release_name}"
+        output.append(f"* {header}")
+        if release.get("html_url"):
+            output.append(f"  URL: {release['html_url']}")
+        output.append("  Changes:")
+        for line in _release_changelog_lines(release.get("body", "")):
+            output.append(f"    {line}")
+    remaining = len(releases) - len(shown)
+    if remaining > 0:
+        output.append(f"* ... and {remaining} more newer release(s).")
+    return "\n".join(output)
+
+
+def _prompt_continue_with_update(local_version, newer_releases):
+    latest = newer_releases[0]
+    print("A newer HyperX Alpha release is available on GitHub.")
+    print(f"Current source version: v{local_version}")
+    print(f"Latest available release: {latest['tag_name']}")
+    print("")
+    print("Changelog for newer releases:")
+    print(_format_update_changelog(newer_releases))
+    if not sys.stdin.isatty():
+        print("Non-interactive mode detected; continuing with current source version.")
+        return True
+    reply = input("Continue installation with the current source anyway? [y/N] ").strip()
+    return reply.lower().startswith("y")
+
+
+def _check_for_github_updates_before_install():
+    local_version = _read_local_version()
+    local_semver = _parse_semver(local_version)
+    if local_semver is None:
+        print(
+            f"Update check skipped: local version '{local_version}' "
+            "is not a semantic version."
+        )
+        return True
+
+    repo = _resolve_github_repo()
+    payload, error = _fetch_github_releases(repo)
+    if error is not None:
+        print(f"Update check skipped: {error}.")
+        return True
+
+    releases = _collect_stable_semver_releases(payload)
+    if not releases:
+        print("Update check: no stable semantic GitHub releases found.")
+        return True
+
+    newer = _newer_releases(local_version, releases)
+    if not newer:
+        return True
+    return _prompt_continue_with_update(local_version, newer)
 
 
 def _read_os_release():
@@ -559,6 +797,10 @@ def _write_install_receipt(data):
 def install_all(scope=None):
     if os.geteuid() != 0:
         print("Please run the installer with sudo.")
+        return False
+
+    if not _check_for_github_updates_before_install():
+        print("Installation cancelled by user.")
         return False
 
     ok = True

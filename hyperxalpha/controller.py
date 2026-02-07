@@ -11,12 +11,22 @@ try:
 except ImportError as exc:
     raise RuntimeError("PySide6 is required (python3-pyside6)") from exc
 
-from . import app_display_name
+from . import APP_NAME, app_display_name
 from .constants import Command, ConnectionStatus
 from .device import HidIoError, HidUnavailable
 from .device_service import DeviceOpenSignals, DeviceReader, DeviceService
 from .settings_service import SettingsService
 from .view import HyperxViewMixin, LogDialog
+
+
+OPEN_RETRY_INTERVAL_MS = 3000
+POLL_INTERVAL_DISCONNECTED_MS = 5000
+POLL_INTERVAL_CONNECTED_MS = 30000
+MIC_STATE_PROBE_TIMEOUT_MS = 1200
+DEVICE_HOTPLUG_INTERVAL_MS = 2500
+CONNECTION_NOTIFY_DEBOUNCE_MS = 1800
+BATTERY_NOTIFY_DEBOUNCE_MS = 1800
+TRANSIENT_TX_FAILURE_LIMIT = 2
 
 
 class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
@@ -42,17 +52,18 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
         self._device_ready = False
         self._shutting_down = False
         self._open_retry_timer = QtCore.QTimer(self)
-        self._open_retry_timer.setInterval(3000)
+        self._open_retry_timer.setInterval(OPEN_RETRY_INTERVAL_MS)
         self._open_retry_timer.timeout.connect(self._start_device_open)
         self._reader_timeout_ms = 100
         self._last_open_error = None
         self._last_io_error = None
+        self._transient_tx_failures = 0
         self._poll_timer = QtCore.QTimer(self)
-        self._poll_timer.setInterval(5000)
+        self._poll_timer.setInterval(POLL_INTERVAL_DISCONNECTED_MS)
         self._poll_timer.timeout.connect(self._poll_headset)
         self._mic_state_probe_timer = QtCore.QTimer(self)
         self._mic_state_probe_timer.setSingleShot(True)
-        self._mic_state_probe_timer.setInterval(1200)
+        self._mic_state_probe_timer.setInterval(MIC_STATE_PROBE_TIMEOUT_MS)
         self._mic_state_probe_timer.timeout.connect(self._on_mic_state_probe_timeout)
         self._mic_state_reported = False
 
@@ -64,7 +75,7 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
         self._last_device_signature = ()
         self._last_device_scan_error = None
         self._device_hotplug_timer = QtCore.QTimer(self)
-        self._device_hotplug_timer.setInterval(2500)
+        self._device_hotplug_timer.setInterval(DEVICE_HOTPLUG_INTERVAL_MS)
         self._device_hotplug_timer.timeout.connect(self._poll_device_hotplug)
 
         self.status = ConnectionStatus.DISCONNECTED
@@ -83,7 +94,7 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
 
         self._connection_notify_timer = QtCore.QTimer(self)
         self._connection_notify_timer.setSingleShot(True)
-        self._connection_notify_timer.setInterval(1800)
+        self._connection_notify_timer.setInterval(CONNECTION_NOTIFY_DEBOUNCE_MS)
         self._connection_notify_timer.timeout.connect(
             self._flush_connection_notification
         )
@@ -93,7 +104,7 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
 
         self._battery_notify_timer = QtCore.QTimer(self)
         self._battery_notify_timer.setSingleShot(True)
-        self._battery_notify_timer.setInterval(1800)
+        self._battery_notify_timer.setInterval(BATTERY_NOTIFY_DEBOUNCE_MS)
         self._battery_notify_timer.timeout.connect(self._flush_battery_notification)
         self._pending_battery_notification = None
         self._battery_notification_cooldown_seconds = 900.0
@@ -106,6 +117,17 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
         self._stdout_logs = os.environ.get("HYPERX_LOG_STDOUT", "0") == "1"
 
         self._theme_is_dark = False
+        self._packet_handlers = {
+            0x03: self._handle_connection_state_packet,
+            0x07: self._handle_sleep_state_packet,
+            0x09: self._handle_voice_state_packet,
+            0x0A: self._handle_mic_monitor_state_packet,
+            0x0B: self._handle_battery_state_packet,
+            0x12: self._handle_sleep_state_packet,
+            0x13: self._handle_voice_state_packet,
+            0x22: self._handle_mic_monitor_feedback_packet,
+            0x24: self._handle_connection_state_packet,
+        }
 
         self.settings = self._settings_service.load()
         if self._settings_service.autostart_enabled() and not self.settings.start_in_tray:
@@ -149,7 +171,7 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
     def _format_packet(self, data):
         return " ".join(f"{byte:02X}" for byte in data)
 
-    def _send_command(self, cmd, label=None):
+    def _send_command(self, cmd, label=None, allow_transient_failure=False):
         command_value = int(cmd)
         command_name = getattr(cmd, "name", None) or label or f"CMD_0x{command_value:08X}"
         if not self._device_ready:
@@ -161,14 +183,41 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
         try:
             sent = self._device_service.send_command(cmd)
         except HidIoError as exc:
-            self._handle_device_io_error(f"TX {command_name} failed: {exc}")
+            message = f"TX {command_name} failed: {exc}"
+            if allow_transient_failure:
+                self._transient_tx_failures += 1
+                self._log(
+                    "Device I/O transient error "
+                    f"({self._transient_tx_failures}/{TRANSIENT_TX_FAILURE_LIMIT}): {message}"
+                )
+                if self._transient_tx_failures >= TRANSIENT_TX_FAILURE_LIMIT:
+                    self._transient_tx_failures = 0
+                    self._handle_device_io_error(message)
+            else:
+                self._transient_tx_failures = 0
+                self._handle_device_io_error(message)
             return False
-        if not sent:
-            self._handle_device_io_error(
+        if sent:
+            self._transient_tx_failures = 0
+            return True
+        if allow_transient_failure:
+            self._transient_tx_failures += 1
+            self._log(
+                "Device I/O transient error "
+                f"({self._transient_tx_failures}/{TRANSIENT_TX_FAILURE_LIMIT}): "
                 f"TX {command_name} failed: device handle unavailable."
             )
+            if self._transient_tx_failures >= TRANSIENT_TX_FAILURE_LIMIT:
+                self._transient_tx_failures = 0
+                self._handle_device_io_error(
+                    f"TX {command_name} failed: device handle unavailable."
+                )
             return False
-        return True
+        self._transient_tx_failures = 0
+        self._handle_device_io_error(
+            f"TX {command_name} failed: device handle unavailable."
+        )
+        return False
 
     def _show_logs(self):
         if self._log_dialog is None:
@@ -319,18 +368,9 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
         if reason:
             self._log(reason)
         self._device_ready = False
-        self._mic_state_reported = False
-        self._mic_state_probe_timer.stop()
-        self._clear_pending_battery_notifications()
         self._stop_reader()
         self._device_service.close()
-        self.status = ConnectionStatus.DISCONNECTED
-        self.battery = None
-        self._battery_notified_levels.clear()
-        self._set_controls_enabled(False)
-        self._set_tray_quick_controls_enabled(False)
-        self._set_status_text()
-        self._update_tray_icon()
+        self._apply_disconnected_state(clear_battery_history=True)
         self._open_retry_timer.stop()
         QtCore.QTimer.singleShot(0, self._start_device_open)
 
@@ -378,6 +418,7 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
         self._device_ready = True
         self._last_open_error = None
         self._last_io_error = None
+        self._transient_tx_failures = 0
         self._open_retry_timer.stop()
         self._log("Device opened.")
         self._reader = DeviceReader(
@@ -390,22 +431,14 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
         self._reader.start()
         if not self._poll_timer.isActive():
             self._poll_timer.start()
-        self._send_command(Command.CONNECTION_STATE)
+        self._send_command(Command.CONNECTION_STATE, allow_transient_failure=True)
 
     def _on_device_failed(self, generation, message):
         self._opener_thread = None
         if self._shutting_down or generation != self._open_generation:
             return
         self._device_ready = False
-        self._mic_state_reported = False
-        self._mic_state_probe_timer.stop()
-        self._clear_pending_battery_notifications()
-        self.status = ConnectionStatus.DISCONNECTED
-        self.battery = None
-        self._set_controls_enabled(False)
-        self._set_tray_quick_controls_enabled(False)
-        self._set_status_text()
-        self._update_tray_icon()
+        self._apply_disconnected_state()
         if message != self._last_open_error:
             self._last_open_error = message
             self._log(f"Device unavailable: {message}")
@@ -421,26 +454,15 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
         if message != self._last_io_error:
             self._last_io_error = message
             self._log(f"Device I/O error: {message}")
-
-        was_connected = self.status == ConnectionStatus.CONNECTED
+        self._transient_tx_failures = 0
         self._device_ready = False
-        self._mic_state_reported = False
-        self._mic_state_probe_timer.stop()
-        self._clear_pending_battery_notifications()
         self._stop_reader()
         self._device_service.close()
-        self.status = ConnectionStatus.DISCONNECTED
-        self.battery = None
-        self._battery_notified_levels.clear()
-        self._set_controls_enabled(False)
-        self._set_tray_quick_controls_enabled(False)
-        self._set_status_text()
-        self._update_tray_icon()
-        if was_connected:
-            self._send_connection_notification(connected=False)
-        self._poll_timer.setInterval(5000)
-        if not self._poll_timer.isActive():
-            self._poll_timer.start()
+        self._apply_disconnected_state(
+            notify_status_change=True,
+            clear_battery_history=True,
+            poll_interval_ms=POLL_INTERVAL_DISCONNECTED_MS,
+        )
         if not self._open_retry_timer.isActive():
             self._open_retry_timer.start()
 
@@ -738,16 +760,16 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
     def _request_feature_states(self):
         if not self._device_ready:
             return
-        self._send_command(Command.STATUS_REQUEST)
-        self._send_command(Command.SLEEP_STATE)
-        self._send_command(Command.VOICE_STATE)
+        self._send_command(Command.STATUS_REQUEST, allow_transient_failure=True)
+        self._send_command(Command.SLEEP_STATE, allow_transient_failure=True)
+        self._send_command(Command.VOICE_STATE, allow_transient_failure=True)
         self._request_mic_monitor_state()
 
     def _request_mic_monitor_state(self):
         if not self._device_ready:
             return
         self._mic_state_reported = False
-        self._send_command(Command.MIC_MONITOR_STATE)
+        self._send_command(Command.MIC_MONITOR_STATE, allow_transient_failure=True)
         self._mic_state_probe_timer.start()
 
     def _on_mic_state_probe_timeout(self):
@@ -761,10 +783,10 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
         if not self._device_ready:
             return
         if self.status != ConnectionStatus.CONNECTED:
-            self._send_command(Command.CONNECTION_STATE)
+            self._send_command(Command.CONNECTION_STATE, allow_transient_failure=True)
             return
-        self._send_command(Command.STATUS_REQUEST)
-        self._send_command(Command.PING)
+        self._send_command(Command.STATUS_REQUEST, allow_transient_failure=True)
+        self._send_command(Command.PING, allow_transient_failure=True)
 
     def _maybe_notify_battery(self):
         if not self.settings.tray_notifications:
@@ -956,6 +978,35 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
             return f"{hours} Hours Remaining ({self.battery}%)"
         return "Power Off"
 
+    def _apply_disconnected_state(
+        self,
+        *,
+        notify_status_change=False,
+        log_status_change=False,
+        clear_battery_history=False,
+        poll_interval_ms=None,
+    ):
+        was_disconnected = self.status == ConnectionStatus.DISCONNECTED
+        self.status = ConnectionStatus.DISCONNECTED
+        self._set_controls_enabled(False)
+        self._set_tray_quick_controls_enabled(False)
+        self._set_status_text()
+        self._update_tray_icon()
+        if log_status_change and not was_disconnected:
+            self._log("Status: DISCONNECTED")
+        if notify_status_change and not was_disconnected:
+            self._send_connection_notification(connected=False)
+        self.battery = None
+        if clear_battery_history:
+            self._battery_notified_levels.clear()
+        self._clear_pending_battery_notifications()
+        self._mic_state_reported = False
+        self._mic_state_probe_timer.stop()
+        if poll_interval_ms is not None:
+            self._poll_timer.setInterval(int(poll_interval_ms))
+            if not self._poll_timer.isActive():
+                self._poll_timer.start()
+
     def _on_connect(self):
         was_connected = self.status == ConnectionStatus.CONNECTED
         self.status = ConnectionStatus.CONNECTED
@@ -968,30 +1019,72 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
         if not was_connected:
             self._log("Status: CONNECTED")
             self._send_connection_notification(connected=True)
-            self._poll_timer.setInterval(30000)
+            self._poll_timer.setInterval(POLL_INTERVAL_CONNECTED_MS)
             if not self._poll_timer.isActive():
                 self._poll_timer.start()
             self._apply_saved_mic_monitor_preference()
             self._request_feature_states()
 
     def _on_disconnect(self):
-        was_disconnected = self.status == ConnectionStatus.DISCONNECTED
-        self.status = ConnectionStatus.DISCONNECTED
-        self._set_controls_enabled(False)
-        self._set_tray_quick_controls_enabled(False)
+        self._apply_disconnected_state(
+            notify_status_change=True,
+            log_status_change=True,
+            clear_battery_history=True,
+            poll_interval_ms=POLL_INTERVAL_DISCONNECTED_MS,
+        )
+
+    def _handle_connection_state_packet(self, value):
+        if value == 0x01:
+            self._on_disconnect()
+        elif value == 0x02:
+            self._on_connect()
+
+    def _handle_sleep_state_packet(self, value):
+        if self.status != ConnectionStatus.CONNECTED:
+            return
+        self._updating_controls = True
+        if value == 0x0A:
+            self.sleep_combo.setCurrentIndex(0)
+        elif value == 0x14:
+            self.sleep_combo.setCurrentIndex(1)
+        elif value == 0x1E:
+            self.sleep_combo.setCurrentIndex(2)
+        self._updating_controls = False
+        self._sync_tray_quick_controls_from_ui()
+
+    def _handle_voice_state_packet(self, value):
+        if self.status != ConnectionStatus.CONNECTED:
+            return
+        self._updating_controls = True
+        self.voice_switch.setChecked(value == 0x01)
+        self._updating_controls = False
+        self._sync_tray_quick_controls_from_ui()
+
+    def _handle_mic_monitor_state_packet(self, value):
+        if self.status != ConnectionStatus.CONNECTED:
+            return
+        if value in (0x00, 0x01):
+            self._mic_state_reported = True
+            self._mic_state_probe_timer.stop()
+            self._handle_reported_mic_monitor_state(value == 0x01)
+
+    def _handle_battery_state_packet(self, value):
+        if self.status != ConnectionStatus.CONNECTED:
+            return
+        if not 0 <= value <= 100:
+            self._log(f"Ignoring invalid battery value from headset: {value}")
+            return
+        self.battery = value
         self._set_status_text()
         self._update_tray_icon()
-        if not was_disconnected:
-            self._log("Status: DISCONNECTED")
-            self._send_connection_notification(connected=False)
-        self.battery = None
-        self._battery_notified_levels.clear()
-        self._clear_pending_battery_notifications()
-        self._mic_state_reported = False
+        self._maybe_notify_battery()
+
+    def _handle_mic_monitor_feedback_packet(self, value):
+        if self.status != ConnectionStatus.CONNECTED:
+            return
+        self._mic_state_reported = True
         self._mic_state_probe_timer.stop()
-        self._poll_timer.setInterval(5000)
-        if not self._poll_timer.isActive():
-            self._poll_timer.start()
+        self._handle_reported_mic_monitor_state(value > 0)
 
     def _handle_packet(self, data):
         if self._verbose_io_logs:
@@ -1001,80 +1094,12 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
         if data[0] != 0x21 or data[1] != 0xBB:
             return
 
+        self._transient_tx_failures = 0
         code = data[2]
         value = data[3]
-
-        if code == 0x03:
-            if value == 0x01:
-                self._on_disconnect()
-            elif value == 0x02:
-                self._on_connect()
-        elif code == 0x07:
-            if self.status != ConnectionStatus.CONNECTED:
-                return
-            self._updating_controls = True
-            if value == 0x0A:
-                self.sleep_combo.setCurrentIndex(0)
-            elif value == 0x14:
-                self.sleep_combo.setCurrentIndex(1)
-            elif value == 0x1E:
-                self.sleep_combo.setCurrentIndex(2)
-            self._updating_controls = False
-            self._sync_tray_quick_controls_from_ui()
-        elif code == 0x09:
-            if self.status != ConnectionStatus.CONNECTED:
-                return
-            self._updating_controls = True
-            self.voice_switch.setChecked(value == 0x01)
-            self._updating_controls = False
-            self._sync_tray_quick_controls_from_ui()
-        elif code == 0x0A:
-            if self.status != ConnectionStatus.CONNECTED:
-                return
-            if value in (0x00, 0x01):
-                self._mic_state_reported = True
-                self._mic_state_probe_timer.stop()
-                self._handle_reported_mic_monitor_state(value == 0x01)
-        elif code == 0x0B:
-            if self.status != ConnectionStatus.CONNECTED:
-                return
-            if not 0 <= value <= 100:
-                self._log(f"Ignoring invalid battery value from headset: {value}")
-                return
-            self.battery = value
-            self._set_status_text()
-            self._update_tray_icon()
-            self._maybe_notify_battery()
-        elif code == 0x12:
-            if self.status != ConnectionStatus.CONNECTED:
-                return
-            self._updating_controls = True
-            if value == 0x0A:
-                self.sleep_combo.setCurrentIndex(0)
-            elif value == 0x14:
-                self.sleep_combo.setCurrentIndex(1)
-            elif value == 0x1E:
-                self.sleep_combo.setCurrentIndex(2)
-            self._updating_controls = False
-            self._sync_tray_quick_controls_from_ui()
-        elif code == 0x13:
-            if self.status != ConnectionStatus.CONNECTED:
-                return
-            self._updating_controls = True
-            self.voice_switch.setChecked(value == 0x01)
-            self._updating_controls = False
-            self._sync_tray_quick_controls_from_ui()
-        elif code == 0x22:
-            if self.status != ConnectionStatus.CONNECTED:
-                return
-            self._mic_state_reported = True
-            self._mic_state_probe_timer.stop()
-            self._handle_reported_mic_monitor_state(value > 0)
-        elif code == 0x24:
-            if value == 0x01:
-                self._on_disconnect()
-            elif value == 0x02:
-                self._on_connect()
+        handler = self._packet_handlers.get(code)
+        if handler is not None:
+            handler(value)
 
     def quit(self):
         if self._shutting_down:
@@ -1100,6 +1125,24 @@ def run(start_hidden=False, use_tray=True):
         os.environ.setdefault("QT_XCB_GL_INTEGRATION", "none")
         QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_UseSoftwareOpenGL)
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+    runtime_dir = QtCore.QStandardPaths.writableLocation(QtCore.QStandardPaths.RuntimeLocation)
+    if not runtime_dir:
+        runtime_dir = QtCore.QStandardPaths.writableLocation(QtCore.QStandardPaths.TempLocation)
+    lock_dir = Path(runtime_dir) / "hyperxalpha"
+    try:
+        lock_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        lock_dir = Path("/tmp")
+    lock = QtCore.QLockFile(str(lock_dir / "app.lock"))
+    if not lock.tryLock(0):
+        QtWidgets.QMessageBox.warning(
+            None,
+            APP_NAME,
+            f"{APP_NAME} e' gia in esecuzione.",
+        )
+        return None
+    app._single_instance_lock = lock
+    app.aboutToQuit.connect(lock.unlock)
     app.setQuitOnLastWindowClosed(False if use_tray else True)
     win = HyperxWindow(start_hidden=start_hidden, use_tray=use_tray)
     app.exec()

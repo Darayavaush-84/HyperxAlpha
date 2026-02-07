@@ -95,11 +95,13 @@ Installer actions:
 - deploys runtime files and launcher
 - creates desktop entry (user/system scope)
 - stops running HyperX Alpha instances before updating runtime files
+- checks GitHub releases for newer versions and shows release changelog before continuing
 
 Useful options:
 
 - `--check` verify runtime prerequisites
 - `--scope user|system` force desktop-entry scope
+- `HYPERX_GITHUB_REPO=owner/repo` override repository used for update checks
 
 ## Uninstaller
 
