@@ -1,6 +1,7 @@
 # Python caches / bytecode
 __pycache__/
 *.py[cod]
+tests/
 
 # Legacy C++ build output
 hyperxalpha/old/build/
