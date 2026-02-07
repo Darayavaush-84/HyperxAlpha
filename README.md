@@ -95,7 +95,7 @@ Installer actions:
 - deploys runtime files and launcher
 - creates desktop entry (user/system scope)
 - stops running HyperX Alpha instances before updating runtime files
-- checks GitHub releases for newer versions and shows release changelog before continuing
+- checks GitHub releases for updates and shows a readable changelog before continuing
 
 Useful options:
 

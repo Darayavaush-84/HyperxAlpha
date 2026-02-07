@@ -244,7 +244,7 @@ def _format_update_changelog(releases):
 
 def _prompt_continue_with_update(local_version, newer_releases):
     latest = newer_releases[0]
-    print("A newer HyperX Alpha release is available on GitHub.")
+    print("A newer HyperX Alpha release is available on GitHub than this local source.")
     print(f"Current source version: v{local_version}")
     print(f"Latest available release: {latest['tag_name']}")
     print("")
