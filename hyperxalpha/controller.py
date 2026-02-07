@@ -11,6 +11,7 @@ try:
 except ImportError as exc:
     raise RuntimeError("PySide6 is required (python3-pyside6)") from exc
 
+from . import app_display_name
 from .constants import Command, ConnectionStatus
 from .device import HidIoError, HidUnavailable
 from .device_service import DeviceOpenSignals, DeviceReader, DeviceService
@@ -23,7 +24,7 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
         super().__init__()
         self.setObjectName("rootWindow")
         self.setAutoFillBackground(True)
-        self.setWindowTitle("HyperX Alpha v1.0.0")
+        self.setWindowTitle(app_display_name())
         self.setMinimumSize(920, 640)
         self.resize(980, 700)
 
@@ -698,6 +699,30 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
         if persist:
             self._persist_mic_monitor_state(active)
 
+    def _apply_saved_mic_monitor_preference(self):
+        cached = self.settings.mic_monitor_state
+        if cached is None:
+            return
+        desired_active = bool(cached)
+        self._set_mic_monitor_state(desired_active, persist=False)
+        if desired_active:
+            self._send_command(Command.MICROPHONE_MONITOR)
+        else:
+            self._send_command(Command.MICROPHONE_MONITOR_OFF)
+
+    def _handle_reported_mic_monitor_state(self, reported_active):
+        cached = self.settings.mic_monitor_state
+        if cached is None:
+            self._set_mic_monitor_state(bool(reported_active), persist=False)
+            return
+        desired_active = bool(cached)
+        self._set_mic_monitor_state(desired_active, persist=False)
+        if bool(reported_active) != desired_active:
+            if desired_active:
+                self._send_command(Command.MICROPHONE_MONITOR)
+            else:
+                self._send_command(Command.MICROPHONE_MONITOR_OFF)
+
     def _on_mic_toggle(self, active):
         if self._updating_controls:
             return
@@ -730,10 +755,7 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
             return
         if self._mic_state_reported:
             return
-        cached = self.settings.mic_monitor_state
-        if cached is None:
-            return
-        self._set_mic_monitor_state(bool(cached), persist=False)
+        self._apply_saved_mic_monitor_preference()
 
     def _poll_headset(self):
         if not self._device_ready:
@@ -949,6 +971,7 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
             self._poll_timer.setInterval(30000)
             if not self._poll_timer.isActive():
                 self._poll_timer.start()
+            self._apply_saved_mic_monitor_preference()
             self._request_feature_states()
 
     def _on_disconnect(self):
@@ -1011,7 +1034,7 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
             if value in (0x00, 0x01):
                 self._mic_state_reported = True
                 self._mic_state_probe_timer.stop()
-                self._set_mic_monitor_state(value == 0x01)
+                self._handle_reported_mic_monitor_state(value == 0x01)
         elif code == 0x0B:
             if self.status != ConnectionStatus.CONNECTED:
                 return
@@ -1046,7 +1069,7 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
                 return
             self._mic_state_reported = True
             self._mic_state_probe_timer.stop()
-            self._set_mic_monitor_state(value > 0)
+            self._handle_reported_mic_monitor_state(value > 0)
         elif code == 0x24:
             if value == 0x01:
                 self._on_disconnect()

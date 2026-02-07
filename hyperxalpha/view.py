@@ -1,5 +1,6 @@
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from . import APP_NAME
 from .constants import ConnectionStatus
 
 
@@ -81,13 +82,13 @@ class HyperxViewMixin:
             logo.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         brand_col.addWidget(logo)
 
-        title = QtWidgets.QLabel("HyperX Alpha Control Center")
-        title.setObjectName("titleLabel")
-        subtitle = QtWidgets.QLabel("Professional headset management dashboard")
+        self.title_label = QtWidgets.QLabel(f"{APP_NAME} Control Center")
+        self.title_label.setObjectName("titleLabel")
+        subtitle = QtWidgets.QLabel("Headset management dashboard")
         subtitle.setObjectName("subtitleLabel")
         self.status_label = QtWidgets.QLabel("Disconnected")
         self.status_label.setObjectName("statusLabel")
-        brand_col.addWidget(title)
+        brand_col.addWidget(self.title_label)
         brand_col.addWidget(subtitle)
         brand_col.addWidget(self.status_label)
         brand_col.addStretch(1)
