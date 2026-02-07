@@ -1,9 +1,11 @@
 import argparse
 import json
 import os
+import signal
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 import pwd
@@ -22,6 +24,26 @@ RECEIPT_PATH = f"{STATE_DIR}/install-receipt.json"
 RUNTIME_ROOT = Path("/opt/hyperxalpha")
 RUNTIME_PACKAGE_DIR = RUNTIME_ROOT / "hyperxalpha"
 LAUNCHER_PATH = Path("/usr/local/bin/hyperxalpha")
+SOURCE_PACKAGE_DIR = Path(__file__).resolve().parent / "hyperxalpha"
+RUNTIME_MODULE_FILES = (
+    "__init__.py",
+    "__main__.py",
+    "constants.py",
+    "controller.py",
+    "device.py",
+    "device_service.py",
+    "settings.py",
+    "settings_service.py",
+    "ui.py",
+    "view.py",
+)
+RUNTIME_RESOURCE_DIRS = ("assets",)
+
+
+def _source_python_modules(source_package_dir):
+    return sorted(
+        path.name for path in source_package_dir.glob("*.py") if path.is_file()
+    )
 
 
 def _read_os_release():
@@ -134,31 +156,82 @@ def _escape_desktop_value(value):
     return value.replace("\\", "\\\\").replace(" ", "\\ ")
 
 
-def _runtime_copy_ignore(_dir, names):
-    ignored = set()
-    for name in names:
-        if name in {"__pycache__", "old"}:
-            ignored.add(name)
-            continue
-        if name.endswith((".pyc", ".pyo")):
-            ignored.add(name)
-    return ignored
-
-
 def _install_runtime_files():
-    source_package_dir = Path(__file__).resolve().parent
+    source_package_dir = SOURCE_PACKAGE_DIR
+    if not source_package_dir.is_dir():
+        print(f"Source package directory not found: {source_package_dir}")
+        return False
+
+    discovered_modules = set(_source_python_modules(source_package_dir))
+    whitelist_modules = set(RUNTIME_MODULE_FILES)
+    missing_from_whitelist = sorted(discovered_modules - whitelist_modules)
+    if missing_from_whitelist:
+        print(
+            "Runtime module whitelist is outdated. "
+            "Please add these modules to RUNTIME_MODULE_FILES:"
+        )
+        for module_name in missing_from_whitelist:
+            print(f"  - {module_name}")
+        return False
+
+    staging_root = None
+    staging_package_dir = None
+    backup_dir = RUNTIME_ROOT / "hyperxalpha-backup"
+    moved_existing = False
+
     try:
         RUNTIME_ROOT.mkdir(parents=True, exist_ok=True)
+        staging_root = Path(tempfile.mkdtemp(prefix="hyperxalpha-staging-", dir=RUNTIME_ROOT))
+        staging_package_dir = staging_root / RUNTIME_PACKAGE_DIR.name
+        staging_package_dir.mkdir(parents=True, exist_ok=True)
+
+        for module_name in RUNTIME_MODULE_FILES:
+            src_file = source_package_dir / module_name
+            if not src_file.is_file():
+                print(f"Missing runtime module file: {src_file}")
+                return False
+            shutil.copy2(src_file, staging_package_dir / module_name)
+
+        for resource_dir in RUNTIME_RESOURCE_DIRS:
+            src_dir = source_package_dir / resource_dir
+            if not src_dir.is_dir():
+                print(f"Missing runtime resource directory: {src_dir}")
+                return False
+            shutil.copytree(src_dir, staging_package_dir / resource_dir)
+
+        if backup_dir.exists():
+            shutil.rmtree(backup_dir)
+
         if RUNTIME_PACKAGE_DIR.exists():
-            shutil.rmtree(RUNTIME_PACKAGE_DIR)
-        shutil.copytree(
-            source_package_dir,
-            RUNTIME_PACKAGE_DIR,
-            ignore=_runtime_copy_ignore,
-        )
+            os.replace(RUNTIME_PACKAGE_DIR, backup_dir)
+            moved_existing = True
+
+        try:
+            os.replace(staging_package_dir, RUNTIME_PACKAGE_DIR)
+        except OSError:
+            if moved_existing and backup_dir.exists() and not RUNTIME_PACKAGE_DIR.exists():
+                os.replace(backup_dir, RUNTIME_PACKAGE_DIR)
+            raise
+
+        if backup_dir.exists():
+            try:
+                shutil.rmtree(backup_dir)
+            except OSError as exc:
+                print(f"Warning: installed runtime but could not remove backup {backup_dir}: {exc}")
     except OSError as exc:
         print(f"Failed to install runtime files in {RUNTIME_ROOT}: {exc}")
         return False
+    finally:
+        if staging_package_dir is not None and staging_package_dir.exists():
+            try:
+                shutil.rmtree(staging_package_dir)
+            except OSError:
+                pass
+        if staging_root is not None and staging_root.exists():
+            try:
+                staging_root.rmdir()
+            except OSError:
+                pass
 
     print(f"Runtime files installed in {RUNTIME_PACKAGE_DIR}.")
     return True
@@ -190,7 +263,7 @@ def _install_launcher():
 def _desktop_icon_path():
     candidates = (
         RUNTIME_PACKAGE_DIR / "assets" / "img" / "hyperx.png",
-        Path(__file__).resolve().parent / "assets" / "img" / "hyperx.png",
+        SOURCE_PACKAGE_DIR / "assets" / "img" / "hyperx.png",
     )
     for path in candidates:
         if path.is_file():
@@ -258,10 +331,22 @@ def _install_desktop_entry():
     return entry_path
 
 
-def _prompt_install_scope():
+def _prompt_install_scope(default_scope="user"):
+    if default_scope not in {"system", "user"}:
+        default_scope = "user"
     if not sys.stdin.isatty():
-        return "system"
-    reply = input("Install desktop entry for all users? [Y/n] ").strip() or "Y"
+        print(
+            "Non-interactive mode detected; "
+            f"defaulting desktop entry scope to '{default_scope}'."
+        )
+        return default_scope
+    if default_scope == "system":
+        prompt = "Install desktop entry for all users? [Y/n] "
+        default_reply = "Y"
+    else:
+        prompt = "Install desktop entry for all users? [y/N] "
+        default_reply = "N"
+    reply = input(prompt).strip() or default_reply
     return "system" if reply.lower().startswith("y") else "user"
 
 
@@ -281,6 +366,33 @@ def _install_desktop_entry_with_scope(scope):
     return _install_desktop_entry()
 
 
+def _install_user_home(scope, desktop_entry_path):
+    if scope != "user":
+        return None
+    if desktop_entry_path:
+        try:
+            resolved = Path(desktop_entry_path).resolve(strict=False)
+            if resolved.name == "hyperxalpha.desktop":
+                applications = resolved.parent
+                if applications.name == "applications":
+                    share = applications.parent
+                    if share.name == "share":
+                        local = share.parent
+                        if local.name == ".local":
+                            home = local.parent
+                            if home.is_absolute():
+                                return str(home)
+        except (OSError, RuntimeError):
+            pass
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        try:
+            return pwd.getpwnam(sudo_user).pw_dir
+        except KeyError:
+            pass
+    return str(Path.home())
+
+
 def _check_hidraw_lib():
     for name in ("libhidapi-hidraw.so.0", "libhidapi-hidraw.so"):
         try:
@@ -291,19 +403,160 @@ def _check_hidraw_lib():
     return False
 
 
+def _read_cmdline_tokens(pid):
+    path = Path("/proc") / str(pid) / "cmdline"
+    try:
+        raw = path.read_bytes()
+    except (FileNotFoundError, PermissionError, OSError):
+        return []
+    if not raw:
+        return []
+    return [
+        token for token in raw.decode("utf-8", errors="ignore").split("\x00") if token
+    ]
+
+
+def _is_python_command(token):
+    return Path(token).name.lower().startswith("python")
+
+
+def _candidate_launcher_tokens():
+    tokens = {str(LAUNCHER_PATH)}
+    found = shutil.which("hyperxalpha")
+    if found:
+        tokens.add(found)
+    return tokens
+
+
+def _is_hyperxalpha_cmdline(tokens, launcher_tokens=None):
+    if not tokens:
+        return False
+    if launcher_tokens:
+        if tokens[0] in launcher_tokens:
+            return True
+        if len(tokens) >= 2 and _is_python_command(tokens[0]) and tokens[1] in launcher_tokens:
+            return True
+        if (
+            len(tokens) >= 3
+            and Path(tokens[0]).name == "env"
+            and _is_python_command(tokens[1])
+            and tokens[2] in launcher_tokens
+        ):
+            return True
+    for index, token in enumerate(tokens[:-1]):
+        if token == "-m" and tokens[index + 1] == "hyperxalpha":
+            return True
+    for token in tokens:
+        if token.endswith("/hyperxalpha/__main__.py"):
+            return True
+    return False
+
+
+def _running_hyperxalpha_pids(launcher_tokens=None):
+    pids = []
+    proc_root = Path("/proc")
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == os.getpid():
+            continue
+        if _is_hyperxalpha_cmdline(
+            _read_cmdline_tokens(pid),
+            launcher_tokens=launcher_tokens,
+        ):
+            pids.append(pid)
+    return sorted(set(pids))
+
+
+def _wait_for_exit(pids, timeout_seconds):
+    remaining = set(pids)
+    deadline = time.time() + timeout_seconds
+    while remaining and time.time() < deadline:
+        still_alive = set()
+        for pid in remaining:
+            try:
+                os.kill(pid, 0)
+                still_alive.add(pid)
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                still_alive.add(pid)
+        remaining = still_alive
+        if remaining:
+            time.sleep(0.1)
+    return remaining
+
+
+def _stop_running_app():
+    if os.geteuid() != 0:
+        return False, False
+
+    launcher_tokens = _candidate_launcher_tokens()
+    pids = _running_hyperxalpha_pids(launcher_tokens=launcher_tokens)
+    if not pids:
+        return False, True
+
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            continue
+
+    remaining = _wait_for_exit(pids, 5.0)
+    if remaining:
+        for pid in list(remaining):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                continue
+        remaining = _wait_for_exit(remaining, 2.0)
+
+    if remaining:
+        print("Some HyperX Alpha processes could not be terminated:", sorted(remaining))
+    return True, not remaining
+
+
 def _write_install_receipt(data):
+    temp_path = None
+    receipt_path = Path(RECEIPT_PATH)
     try:
         Path(STATE_DIR).mkdir(parents=True, exist_ok=True)
-        with open(RECEIPT_PATH, "w", encoding="utf-8") as handle:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=STATE_DIR,
+            prefix="install-receipt-",
+            suffix=".json",
+            delete=False,
+        ) as handle:
             json.dump(data, handle, indent=2, sort_keys=True)
-        print(f"Install receipt written to {RECEIPT_PATH}.")
+            handle.flush()
+            os.fsync(handle.fileno())
+            temp_path = Path(handle.name)
+        os.replace(temp_path, receipt_path)
+        print(f"Install receipt written to {receipt_path}.")
         return True
     except OSError as exc:
         print(f"Failed to write install receipt: {exc}")
         return False
+    finally:
+        if temp_path is not None and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
 
 
-def install_all():
+def install_all(scope=None):
     if os.geteuid() != 0:
         print("Please run the installer with sudo.")
         return False
@@ -311,7 +564,14 @@ def install_all():
     ok = True
     package_manager = None
     packages_requested = []
-    install_scope = _prompt_install_scope()
+    install_scope = scope or _prompt_install_scope(default_scope="user")
+
+    had_running, stopped = _stop_running_app()
+    if had_running and stopped:
+        print("Stopped running HyperX Alpha instance.")
+    elif had_running and not stopped:
+        print("Cannot continue install while HyperX Alpha is still running.")
+        return False
 
     if _is_ubuntu_like():
         package_manager = "apt"
@@ -342,9 +602,9 @@ def install_all():
             print("Failed to install base packages.")
             ok = False
     else:
+        package_manager = "manual"
         print("Package install skipped (unsupported distro).")
         print("Please install the dependencies listed in README.md.")
-        ok = False
 
     if not _install_udev_rule():
         ok = False
@@ -357,6 +617,13 @@ def install_all():
 
     desktop_entry_path = _install_desktop_entry_with_scope(install_scope)
     if desktop_entry_path is None:
+        ok = False
+
+    qt_ok, qt_reason = _check_qt()
+    if qt_ok:
+        print("PySide6 is available.")
+    else:
+        print(f"PySide6 not available: {qt_reason}")
         ok = False
 
     if _check_hidraw_lib():
@@ -379,6 +646,7 @@ def install_all():
         "udev_rule_path": UDEV_RULE_PATH,
         "desktop_entry_path": str(desktop_entry_path) if desktop_entry_path else None,
         "install_scope": install_scope,
+        "install_user_home": _install_user_home(install_scope, desktop_entry_path),
         "runtime_root": str(RUNTIME_ROOT),
         "runtime_package_dir": str(RUNTIME_PACKAGE_DIR),
         "launcher_path": str(LAUNCHER_PATH),
@@ -398,7 +666,15 @@ def main():
     parser.add_argument(
         "--check",
         action="store_true",
-        help="Only check Qt and hidraw availability.",
+        help=(
+            "Check runtime prerequisites (Qt, hidraw, udev rule) and "
+            "report launcher presence."
+        ),
+    )
+    parser.add_argument(
+        "--scope",
+        choices=("user", "system"),
+        help="Desktop entry install scope (used by full install mode).",
     )
     args = parser.parse_args()
 
@@ -417,13 +693,14 @@ def main():
             print("udev rule present.")
         else:
             print("udev rule missing.")
+            ok = False
         if LAUNCHER_PATH.is_file():
             print(f"Launcher present: {LAUNCHER_PATH}")
         else:
             print(f"Launcher missing: {LAUNCHER_PATH}")
         return 0 if ok else 1
 
-    return 0 if install_all() else 1
+    return 0 if install_all(scope=args.scope) else 1
 
 
 if __name__ == "__main__":

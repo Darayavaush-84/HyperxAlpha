@@ -57,6 +57,9 @@ def _read_receipt():
             return json.load(handle)
     except FileNotFoundError:
         return None
+    except json.JSONDecodeError as exc:
+        print(f"Install receipt is corrupted and will be ignored: {exc}")
+        return None
     except OSError as exc:
         print(f"Failed to read install receipt: {exc}")
         return None
@@ -70,7 +73,141 @@ def _candidate_homes():
             homes.add(Path(pwd.getpwnam(sudo_user).pw_dir))
         except KeyError:
             print("Unable to resolve SUDO_USER home directory.")
+    if os.geteuid() == 0:
+        try:
+            users = pwd.getpwall()
+        except OSError:
+            users = []
+        for user in users:
+            if user.pw_uid < 1000:
+                continue
+            shell = user.pw_shell or ""
+            if shell.endswith("nologin") or shell.endswith("false"):
+                continue
+            home = Path(user.pw_dir)
+            if home.is_absolute():
+                homes.add(home)
     return sorted(homes)
+
+
+def _install_scope_from_receipt(receipt):
+    if not receipt:
+        return None
+    scope = receipt.get("install_scope")
+    if not isinstance(scope, str):
+        return None
+    normalized = scope.strip().lower()
+    if normalized in {"system", "user"}:
+        return normalized
+    return None
+
+
+def _invoking_homes():
+    homes = {Path.home()}
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        try:
+            homes.add(Path(pwd.getpwnam(sudo_user).pw_dir))
+        except KeyError:
+            print("Unable to resolve SUDO_USER home directory.")
+    return sorted(homes)
+
+
+def _receipt_user_home(receipt):
+    if not receipt:
+        return None
+    raw_home = receipt.get("install_user_home")
+    if raw_home:
+        try:
+            resolved = Path(raw_home).resolve(strict=False)
+            if resolved.is_absolute():
+                return resolved
+        except (OSError, RuntimeError):
+            pass
+
+    raw_desktop = receipt.get("desktop_entry_path")
+    if not raw_desktop:
+        return None
+    try:
+        desktop_path = Path(raw_desktop).resolve(strict=False)
+    except (OSError, RuntimeError):
+        return None
+    if desktop_path.name != "hyperxalpha.desktop":
+        return None
+    applications_dir = desktop_path.parent
+    if applications_dir.name != "applications":
+        return None
+    share_dir = applications_dir.parent
+    if share_dir.name != "share":
+        return None
+    local_dir = share_dir.parent
+    if local_dir.name != ".local":
+        return None
+    home = local_dir.parent
+    return home if home.is_absolute() else None
+
+
+def _scoped_homes(receipt):
+    if _install_scope_from_receipt(receipt) != "user":
+        return _candidate_homes()
+    receipt_home = _receipt_user_home(receipt)
+    if receipt_home is not None:
+        return [receipt_home]
+    return _invoking_homes()
+
+
+def _path_in_allowed_dirs(path, allowed_dirs, expected_name):
+    try:
+        resolved = path.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return False
+    if resolved.name != expected_name:
+        return False
+    for directory in allowed_dirs:
+        try:
+            directory_resolved = directory.resolve(strict=False)
+        except (OSError, RuntimeError):
+            continue
+        if resolved.parent == directory_resolved:
+            return True
+    return False
+
+
+def _safe_udev_path(path):
+    try:
+        return path.resolve(strict=False) == UDEV_RULE_PATH.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return False
+
+
+def _safe_desktop_path(path):
+    allowed_dirs = [
+        Path("/usr/local/share/applications"),
+        Path("/usr/share/applications"),
+    ]
+    allowed_dirs.extend(
+        home / ".local" / "share" / "applications" for home in _candidate_homes()
+    )
+    return _path_in_allowed_dirs(path, allowed_dirs, "hyperxalpha.desktop")
+
+
+def _safe_launcher_path(path):
+    allowed_dirs = [DEFAULT_LAUNCHER_PATH.parent]
+    allowed_dirs.extend(home / ".local" / "bin" for home in _candidate_homes())
+    return _path_in_allowed_dirs(path, allowed_dirs, "hyperxalpha")
+
+
+def _receipt_path_if_safe(receipt, key, validator, label):
+    if not receipt:
+        return None
+    raw_value = receipt.get(key)
+    if not raw_value:
+        return None
+    path = Path(raw_value)
+    if validator(path):
+        return path
+    print(f"Ignoring unsafe {label} path from receipt: {path}")
+    return None
 
 
 def _read_cmdline_tokens(pid):
@@ -84,9 +221,30 @@ def _read_cmdline_tokens(pid):
     return [token for token in raw.decode("utf-8", errors="ignore").split("\x00") if token]
 
 
-def _is_hyperxalpha_cmdline(tokens):
+def _candidate_launcher_tokens(receipt):
+    return {str(path) for path in _candidate_launcher_paths(receipt)}
+
+
+def _is_python_command(token):
+    name = Path(token).name.lower()
+    return name.startswith("python")
+
+
+def _is_hyperxalpha_cmdline(tokens, launcher_tokens=None):
     if not tokens:
         return False
+    if launcher_tokens:
+        if tokens[0] in launcher_tokens:
+            return True
+        if len(tokens) >= 2 and _is_python_command(tokens[0]) and tokens[1] in launcher_tokens:
+            return True
+        if (
+            len(tokens) >= 3
+            and Path(tokens[0]).name == "env"
+            and _is_python_command(tokens[1])
+            and tokens[2] in launcher_tokens
+        ):
+            return True
     for index, token in enumerate(tokens[:-1]):
         if token == "-m" and tokens[index + 1] == "hyperxalpha":
             return True
@@ -96,7 +254,7 @@ def _is_hyperxalpha_cmdline(tokens):
     return False
 
 
-def _running_hyperxalpha_pids():
+def _running_hyperxalpha_pids(launcher_tokens=None):
     pids = []
     proc_root = Path("/proc")
     try:
@@ -109,7 +267,10 @@ def _running_hyperxalpha_pids():
         pid = int(entry.name)
         if pid == os.getpid():
             continue
-        if _is_hyperxalpha_cmdline(_read_cmdline_tokens(pid)):
+        if _is_hyperxalpha_cmdline(
+            _read_cmdline_tokens(pid),
+            launcher_tokens=launcher_tokens,
+        ):
             pids.append(pid)
     return sorted(set(pids))
 
@@ -133,13 +294,14 @@ def _wait_for_exit(pids, timeout_seconds):
     return remaining
 
 
-def _kill_running_app():
+def _kill_running_app(receipt=None):
     if os.geteuid() != 0:
-        return False
+        return False, False
 
-    pids = _running_hyperxalpha_pids()
+    launcher_tokens = _candidate_launcher_tokens(receipt)
+    pids = _running_hyperxalpha_pids(launcher_tokens=launcher_tokens)
     if not pids:
-        return False
+        return False, True
 
     for pid in pids:
         try:
@@ -162,39 +324,74 @@ def _kill_running_app():
 
     if remaining:
         print("Some HyperX Alpha processes could not be terminated:", sorted(remaining))
-    return True
+    return True, not remaining
+
+
+def _candidate_udev_path(receipt):
+    path = _receipt_path_if_safe(
+        receipt,
+        "udev_rule_path",
+        validator=_safe_udev_path,
+        label="udev rule",
+    )
+    return path if path is not None else UDEV_RULE_PATH
 
 
 def _safe_runtime_root(path):
-    resolved = path.resolve(strict=False)
+    try:
+        resolved = path.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return False
     return str(resolved) == str(DEFAULT_RUNTIME_ROOT) or str(resolved).startswith(
         f"{DEFAULT_RUNTIME_ROOT}/"
     )
 
 
 def _candidate_desktop_paths(receipt):
-    paths = {
-        Path("/usr/local/share/applications/hyperxalpha.desktop"),
-        Path("/usr/share/applications/hyperxalpha.desktop"),
-    }
-    if receipt and receipt.get("desktop_entry_path"):
-        paths.add(Path(receipt["desktop_entry_path"]))
-    for home in _candidate_homes():
-        paths.add(home / ".local" / "share" / "applications" / "hyperxalpha.desktop")
+    scope = _install_scope_from_receipt(receipt)
+    paths = set()
+    if scope in (None, "system"):
+        paths.update(
+            {
+                Path("/usr/local/share/applications/hyperxalpha.desktop"),
+                Path("/usr/share/applications/hyperxalpha.desktop"),
+            }
+        )
+    receipt_path = _receipt_path_if_safe(
+        receipt,
+        "desktop_entry_path",
+        validator=_safe_desktop_path,
+        label="desktop entry",
+    )
+    if receipt_path is not None:
+        paths.add(receipt_path)
+    if scope in (None, "user"):
+        for home in _scoped_homes(receipt):
+            paths.add(home / ".local" / "share" / "applications" / "hyperxalpha.desktop")
     return sorted(paths)
 
 
-def _candidate_autostart_paths():
-    paths = {Path("/etc/xdg/autostart/hyperxalpha.desktop")}
-    for home in _candidate_homes():
-        paths.add(home / ".config" / "autostart" / "hyperxalpha.desktop")
+def _candidate_autostart_paths(receipt=None):
+    scope = _install_scope_from_receipt(receipt)
+    paths = set()
+    if scope in (None, "system"):
+        paths.add(Path("/etc/xdg/autostart/hyperxalpha.desktop"))
+    if scope in (None, "user"):
+        for home in _scoped_homes(receipt):
+            paths.add(home / ".config" / "autostart" / "hyperxalpha.desktop")
     return sorted(paths)
 
 
 def _candidate_launcher_paths(receipt):
     paths = {DEFAULT_LAUNCHER_PATH}
-    if receipt and receipt.get("launcher_path"):
-        paths.add(Path(receipt["launcher_path"]))
+    receipt_path = _receipt_path_if_safe(
+        receipt,
+        "launcher_path",
+        validator=_safe_launcher_path,
+        label="launcher",
+    )
+    if receipt_path is not None:
+        paths.add(receipt_path)
     return sorted(paths)
 
 
@@ -216,11 +413,7 @@ def _candidate_runtime_roots(receipt):
 
 def _collect_leftovers(receipt):
     leftovers = []
-    udev_candidate = (
-        Path(receipt.get("udev_rule_path"))
-        if receipt and receipt.get("udev_rule_path")
-        else UDEV_RULE_PATH
-    )
+    udev_candidate = _candidate_udev_path(receipt)
     if udev_candidate.exists():
         leftovers.append(udev_candidate)
 
@@ -228,7 +421,7 @@ def _collect_leftovers(receipt):
         if path.exists():
             leftovers.append(path)
 
-    for path in _candidate_autostart_paths():
+    for path in _candidate_autostart_paths(receipt):
         if path.exists():
             leftovers.append(path)
 
@@ -255,14 +448,14 @@ def uninstall():
         print("Please run with sudo to remove installed system files.")
         ok = False
     else:
-        if _kill_running_app():
+        had_running, stopped = _kill_running_app(receipt=receipt)
+        if had_running and stopped:
             print("Stopped running HyperX Alpha instance.")
+        elif had_running and not stopped:
+            print("Cannot continue uninstall while HyperX Alpha is still running.")
+            return 1
 
-        udev_path = (
-            Path(receipt.get("udev_rule_path"))
-            if receipt and receipt.get("udev_rule_path")
-            else UDEV_RULE_PATH
-        )
+        udev_path = _candidate_udev_path(receipt)
         if _remove_file(udev_path):
             removed_any = True
             if not _reload_udev_rules():
@@ -280,7 +473,7 @@ def uninstall():
         if _remove_file(desktop_path):
             removed_any = True
 
-    for autostart_path in _candidate_autostart_paths():
+    for autostart_path in _candidate_autostart_paths(receipt):
         if _remove_file(autostart_path):
             removed_any = True
 

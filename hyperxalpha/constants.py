@@ -2,6 +2,9 @@ from enum import IntEnum
 
 VENDOR_ID = 0x03F0
 PRODUCT_ID = 0x098D
+COMPATIBLE_MODELS = {
+    (0x03F0, 0x098D): "HyperX Cloud Alpha Wireless",
+}
 
 
 class Command(IntEnum):

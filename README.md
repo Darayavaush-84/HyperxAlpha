@@ -1,9 +1,28 @@
-# HyperX Alpha (Python rewrite)
+# HyperX Alpha
 
-This is a Python rewrite of the HyperX Alpha Wireless app. It uses Qt 6
-(PySide6) and hidapi (hidraw) via system packages (no venv required).
+Linux desktop app to manage HyperX Cloud Alpha Wireless headsets.
+Built with Python + Qt (PySide6) and hidapi (hidraw).
 
-## Fedora 43 dependencies
+## Features
+
+- Real-time headset status (connection + battery).
+- Headset controls:
+  - Sleep timer (`10 / 20 / 30` minutes)
+  - Voice prompt toggle
+  - Mic monitoring toggle
+- Automatic compatible-device detection (hotplug polling), plus manual `Scan Devices`.
+- System tray integration:
+  - Start hidden / minimize to tray
+  - Quick controls from tray menu (voice, mic, sleep timer)
+  - Show/hide window and quick log access
+- Smart notifications:
+  - Debounced connection/disconnection notifications
+  - Grouped and rate-limited low-battery notifications
+- Persistent preferences (theme, notifications, selected device, mic monitor state).
+
+## Requirements
+
+Fedora example:
 
 ```bash
 sudo dnf install -y \
@@ -12,19 +31,11 @@ sudo dnf install -y \
   hidapi
 ```
 
-On GNOME, a system tray extension may be required for tray icons to be visible.
+Other distros need equivalent packages:
 
-## Other Linux distros (example packages)
-
-- Python 3, PySide6 (Qt 6), hidapi (hidraw)
-
-Package names vary by distro, but the runtime pieces are the same.
-
-## Systray notes
-
-- Tray uses Qt's QSystemTrayIcon.
-- GNOME typically requires a tray extension to show icons.
-- On some Wayland setups, tray icons may be hidden by default.
+- Python 3
+- PySide6 (Qt 6)
+- hidapi with hidraw backend
 
 ## Run
 
@@ -32,52 +43,78 @@ Package names vary by distro, but the runtime pieces are the same.
 python3 -m hyperxalpha
 ```
 
-Run the app as a normal user (no sudo).
+Run as normal user (not `sudo`).
 
-### Flags
+### CLI flags
 
-- `--no-tray` Disable tray integration
-- `--start-hidden` Start hidden when tray is available
+- `--no-tray` disable tray integration
+- `--start-hidden` start hidden when tray is available
 
-### Performance / debug env vars
+### Debug env vars
 
-- `HYPERX_FORCE_SOFTWARE_OPENGL=1` force software OpenGL fallback (disabled by default)
+- `HYPERX_FORCE_SOFTWARE_OPENGL=1` force software OpenGL
 - `HYPERX_DEBUG_IO=1` enable verbose RX/TX packet logging
+- `HYPERX_LOG_STDOUT=1` mirror app logs to stdout
 
-## Autostart + settings
+## Settings
 
-Enable "Always start in Systray" in the UI to create an autostart entry.
-Preferences are stored in `~/.config/hyperxalpha/settings.json`.
+- Preferences file: `~/.config/hyperxalpha/settings.json`
+- Autostart file (when enabled): `~/.config/autostart/hyperxalpha.desktop`
 
-## Install helper (Fedora/Ubuntu/Debian)
+## Report new HyperX models
 
-```bash
-sudo python3 hyperxalpha/installer.py
-```
-
-This installs dependencies, writes the udev rule, and creates a desktop entry
-for KDE/GNOME so the app appears in the launcher. The installer asks whether
-to install the desktop entry for all users or only the current user.
-All-users entries are written to `/usr/share/applications`.
-Runtime files are installed to `/opt/hyperxalpha` and a launcher is written to
-`/usr/local/bin/hyperxalpha`.
-Use `--check` to verify Qt/hidraw availability (no sudo required).
-The installer also writes an install receipt to `/var/lib/hyperxalpha/install-receipt.json`.
-
-## Uninstall helper
+If your HyperX headset is not detected/supported, run:
 
 ```bash
-sudo python3 hyperxalpha/uninstaller.py
+python3 probe_hyperx_model.py
 ```
 
-This removes the udev rule, desktop entry, launcher, runtime files, and autostart
-entry created by the installer.
-It does not remove system packages, since they may be shared with other apps.
+For machine-readable output:
 
-## Device permissions (udev rule)
+```bash
+python3 probe_hyperx_model.py --json > hyperx-model-report.json
+```
 
-The installer above writes this rule automatically when run with sudo.
-Manual setup:
+Share this information when opening an issue/report:
+
+- full script output (`stdout` or JSON file)
+- exact marketing model name (as printed on box/product page)
+
+The report includes VID/PID, HID path, serial (if available), manufacturer/product strings, and a suggested `COMPATIBLE_MODELS` entry.
+
+## Installer (Fedora/Ubuntu/Debian)
+
+```bash
+sudo python3 installer.py
+```
+
+Installer actions:
+
+- installs required dependencies (when distro is supported)
+- writes udev rule for device permissions
+- deploys runtime files and launcher
+- creates desktop entry (user/system scope)
+- stops running HyperX Alpha instances before updating runtime files
+
+Useful options:
+
+- `--check` verify runtime prerequisites
+- `--scope user|system` force desktop-entry scope
+
+## Uninstaller
+
+```bash
+sudo python3 uninstaller.py
+```
+
+Removes files created by installer (udev rule, launcher, desktop entry, runtime, receipt, autostart entries).
+
+## Notes
+
+- On GNOME, a tray extension may be required to display tray icons.
+- On some Wayland setups, tray icons may be hidden by default.
+
+## Device permissions (manual udev setup)
 
 ```bash
 sudo tee /etc/udev/rules.d/50-hyperxalpha.rules >/dev/null <<'EOF_RULE'
@@ -88,7 +125,3 @@ EOF_RULE
 sudo udevadm control --reload-rules
 sudo udevadm trigger
 ```
-
-## Changelog
-
-See `CHANGELOG.md`.
