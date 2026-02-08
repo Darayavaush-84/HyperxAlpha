@@ -700,24 +700,24 @@ class HyperxViewMixin:
     def _set_status_text(self):
         connected = self.status == ConnectionStatus.CONNECTED
         busy = bool(getattr(self, "_control_channel_busy", False))
-        if connected and self.battery is not None:
+        if busy:
+            self.status_label.setText("Control Channel Busy")
+        elif connected and self.battery is not None:
             self.status_label.setText(f"Battery: {self.battery}%")
         elif connected:
             self.status_label.setText("Connected")
-        elif busy:
-            self.status_label.setText("Control Channel Busy")
         else:
             self.status_label.setText("Disconnected")
 
         if not hasattr(self, "connection_badge"):
             return
 
-        if connected:
-            badge_state = "connected"
-            badge_text = "Connected"
-        elif busy:
+        if busy:
             badge_state = "busy"
             badge_text = "Busy"
+        elif connected:
+            badge_state = "connected"
+            badge_text = "Connected"
         else:
             badge_state = "disconnected"
             badge_text = "Disconnected"
@@ -729,17 +729,17 @@ class HyperxViewMixin:
         if not hasattr(self, "battery_summary_label") or not hasattr(self, "battery_progress"):
             return
 
-        if connected and self.battery is not None:
+        if busy:
+            self.battery_summary_label.setText(
+                "Headset detected, but telemetry is busy (Discord/game may be using it)."
+            )
+            self.battery_progress.setValue(0)
+        elif connected and self.battery is not None:
             hours = self.battery * 3
             self.battery_summary_label.setText(f"{self.battery}% (about {hours}h remaining)")
             self.battery_progress.setValue(self.battery)
         elif connected:
             self.battery_summary_label.setText("Reading headset battery...")
-            self.battery_progress.setValue(0)
-        elif busy:
-            self.battery_summary_label.setText(
-                "Headset detected, but telemetry is busy (Discord/game may be using it)."
-            )
             self.battery_progress.setValue(0)
         else:
             self.battery_summary_label.setText("Headset powered off")

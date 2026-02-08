@@ -933,12 +933,14 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
         return bool(
             self._device_ready
             and self.status == ConnectionStatus.CONNECTED
+            and not self._control_channel_busy
         )
 
     def _can_use_sleep_controls(self):
         return bool(
             self._device_ready
             and self.status == ConnectionStatus.CONNECTED
+            and not self._control_channel_busy
         )
 
     def _sync_control_availability(self):
