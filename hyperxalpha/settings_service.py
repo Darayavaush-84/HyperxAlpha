@@ -11,5 +11,5 @@ class SettingsService:
     def autostart_enabled(self):
         return autostart_enabled()
 
-    def set_autostart(self, enabled):
-        return set_autostart(enabled)
+    def set_autostart(self, enabled, start_hidden=False):
+        return set_autostart(enabled, start_hidden=start_hidden)

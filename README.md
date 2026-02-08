@@ -19,6 +19,9 @@ Built with Python + Qt (PySide6) and hidapi (hidraw).
   - Debounced connection/disconnection notifications
   - Grouped and rate-limited low-battery notifications
 - Persistent preferences (theme, notifications, selected device, mic monitor state).
+  - Login behavior is configurable independently:
+    - `Start on Login`
+    - `Start Hidden (Tray)`
 
 ## Requirements
 

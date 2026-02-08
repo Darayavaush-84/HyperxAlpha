@@ -19,7 +19,7 @@ def main():
     from .ui import run
 
     settings = load_settings()
-    start_hidden = args.start_hidden or settings.start_in_tray
+    start_hidden = args.start_hidden or settings.start_hidden
     run(start_hidden=start_hidden, use_tray=not args.no_tray)
     return 0
 

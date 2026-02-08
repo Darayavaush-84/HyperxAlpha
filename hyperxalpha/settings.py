@@ -24,7 +24,8 @@ VALID_THEME_MODES = {"system", "light", "dark"}
 
 @dataclass
 class AppSettings:
-    start_in_tray: bool = False
+    start_on_login: bool = False
+    start_hidden: bool = False
     mic_monitor_state: Optional[bool] = None
     selected_device_key: Optional[str] = None
     tray_notifications: bool = True
@@ -71,7 +72,8 @@ def load_settings():
     except (OSError, json.JSONDecodeError):
         return AppSettings()
 
-    start_in_tray = _parse_bool(data.get("start_in_tray"))
+    start_on_login = _parse_bool(data.get("start_on_login"))
+    start_hidden = _parse_bool(data.get("start_hidden"))
     mic_monitor_state = _parse_bool(data.get("mic_monitor_state"))
     tray_raw = (
         data.get("tray_notifications")
@@ -81,7 +83,8 @@ def load_settings():
     tray_notifications = _parse_bool(tray_raw)
 
     return AppSettings(
-        start_in_tray=False if start_in_tray is None else start_in_tray,
+        start_on_login=False if start_on_login is None else start_on_login,
+        start_hidden=False if start_hidden is None else start_hidden,
         mic_monitor_state=mic_monitor_state,
         selected_device_key=_normalize_device_key(data.get("selected_device_key")),
         tray_notifications=True if tray_notifications is None else tray_notifications,
@@ -93,7 +96,10 @@ def save_settings(settings: AppSettings):
     temp_path = None
     try:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        payload = {"start_in_tray": bool(settings.start_in_tray)}
+        payload = {
+            "start_on_login": bool(settings.start_on_login),
+            "start_hidden": bool(settings.start_hidden),
+        }
         mic_monitor_state = _parse_bool(settings.mic_monitor_state)
         if mic_monitor_state is not None:
             payload["mic_monitor_state"] = mic_monitor_state
@@ -190,9 +196,9 @@ def _resolve_icon_path():
     return LOCAL_ICON_PATH
 
 
-def _autostart_desktop_entry():
+def _autostart_desktop_entry(start_hidden=False):
     icon_value = _escape_desktop_value(str(_resolve_icon_path()))
-    exec_value = _resolve_exec_command(start_hidden=True)
+    exec_value = _resolve_exec_command(start_hidden=bool(start_hidden))
     return (
         "[Desktop Entry]\n"
         "Type=Application\n"
@@ -205,11 +211,14 @@ def _autostart_desktop_entry():
     )
 
 
-def set_autostart(enabled: bool):
+def set_autostart(enabled: bool, start_hidden=False):
     if enabled:
         try:
             AUTOSTART_DIR.mkdir(parents=True, exist_ok=True)
-            AUTOSTART_PATH.write_text(_autostart_desktop_entry(), encoding="utf-8")
+            AUTOSTART_PATH.write_text(
+                _autostart_desktop_entry(start_hidden=start_hidden),
+                encoding="utf-8",
+            )
             return True
         except OSError:
             return False

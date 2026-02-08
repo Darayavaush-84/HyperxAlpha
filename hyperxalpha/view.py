@@ -5,23 +5,134 @@ from .constants import ConnectionStatus
 
 
 class LogDialog(QtWidgets.QDialog):
+    LOG_LEVELS = ("INFO", "WARN", "DEBUG")
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("HyperX Alpha Logs")
         self.resize(560, 360)
 
         layout = QtWidgets.QVBoxLayout(self)
+        filters = QtWidgets.QHBoxLayout()
+        filters.setContentsMargins(0, 0, 0, 0)
+        filters.setSpacing(12)
+        self.info_filter = QtWidgets.QCheckBox("INFO")
+        self.warn_filter = QtWidgets.QCheckBox("WARN")
+        self.debug_filter = QtWidgets.QCheckBox("DEBUG")
+        for control in (self.info_filter, self.warn_filter, self.debug_filter):
+            control.setChecked(False)
+            control.toggled.connect(self._refresh_view_from_entries)
+            filters.addWidget(control)
+        filters.addStretch(1)
+        self.filter_hint = QtWidgets.QLabel("No filter selected: show all")
+        self.filter_hint.setObjectName("subtleLabel")
+        filters.addWidget(self.filter_hint)
+        self.export_button = QtWidgets.QPushButton("Export All Logs")
+        self.export_button.setObjectName("softButton")
+        self.export_button.setMinimumWidth(150)
+        self.export_button.clicked.connect(self._on_export_clicked)
+        filters.addWidget(self.export_button)
+        layout.addLayout(filters)
         self.text = QtWidgets.QPlainTextEdit()
         self.text.setReadOnly(True)
         layout.addWidget(self.text)
+        self._entries = []
+
+    def _selected_levels(self):
+        selected = set()
+        if self.info_filter.isChecked():
+            selected.add("INFO")
+        if self.warn_filter.isChecked():
+            selected.add("WARN")
+        if self.debug_filter.isChecked():
+            selected.add("DEBUG")
+        return selected
+
+    @staticmethod
+    def _format_entry(entry):
+        timestamp = str(entry.get("timestamp", "")).strip()
+        level = str(entry.get("level", "INFO")).strip().upper() or "INFO"
+        message = str(entry.get("message", ""))
+        return f"[{timestamp}] [{level}] {message}"
+
+    def _default_export_path(self):
+        base_dir = QtCore.QStandardPaths.writableLocation(
+            QtCore.QStandardPaths.DocumentsLocation
+        )
+        if not base_dir:
+            base_dir = QtCore.QDir.homePath()
+        stamp = QtCore.QDateTime.currentDateTime().toString("yyyyMMdd-HHmmss")
+        return QtCore.QDir(base_dir).filePath(f"hyperxalpha-logs-{stamp}.log")
+
+    def _on_export_clicked(self):
+        if not self._entries:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Export Logs",
+                "No logs available to export.",
+            )
+            return
+        target_path, _selected = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export Logs",
+            self._default_export_path(),
+            "Log files (*.log);;Text files (*.txt);;All files (*)",
+        )
+        if not target_path:
+            return
+        lines = [self._format_entry(entry) for entry in self._entries]
+        try:
+            with open(target_path, "w", encoding="utf-8") as handle:
+                if lines:
+                    handle.write("\n".join(lines))
+                    handle.write("\n")
+        except OSError as exc:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Export Logs",
+                f"Unable to export logs:\n{exc}",
+            )
+            return
+        QtWidgets.QMessageBox.information(
+            self,
+            "Export Logs",
+            f"Logs exported to:\n{target_path}",
+        )
+
+    def _refresh_view_from_entries(self):
+        selected = self._selected_levels()
+        lines = []
+        for entry in self._entries:
+            level = str(entry.get("level", "INFO")).strip().upper() or "INFO"
+            if selected and level not in selected:
+                continue
+            lines.append(self._format_entry(entry))
+        self.text.setPlainText("\n".join(lines))
+        self.text.verticalScrollBar().setValue(self.text.verticalScrollBar().maximum())
+
+    def set_entries(self, entries):
+        self._entries = list(entries or [])
+        self._refresh_view_from_entries()
+
+    def append_entries(self, entries):
+        if not entries:
+            return
+        self._entries.extend(list(entries))
+        self._refresh_view_from_entries()
 
     def set_text(self, text):
+        self._entries = []
         self.text.setPlainText(text)
         self.text.verticalScrollBar().setValue(self.text.verticalScrollBar().maximum())
 
-    def append_line(self, line):
-        self.text.appendPlainText(line)
+    def append_lines(self, lines):
+        if not lines:
+            return
+        self.text.appendPlainText("\n".join(lines))
         self.text.verticalScrollBar().setValue(self.text.verticalScrollBar().maximum())
+
+    def append_line(self, line):
+        self.append_lines([line])
 
 
 class ToggleSwitch(QtWidgets.QAbstractButton):
@@ -213,9 +324,13 @@ class HyperxViewMixin:
         device_widget = QtWidgets.QWidget()
         device_widget.setLayout(device_box)
 
-        self.tray_switch = ToggleSwitch()
-        self.tray_switch.setChecked(self.settings.start_in_tray)
-        self.tray_switch.toggled.connect(self._on_tray_toggle)
+        self.start_on_login_switch = ToggleSwitch()
+        self.start_on_login_switch.setChecked(self.settings.start_on_login)
+        self.start_on_login_switch.toggled.connect(self._on_start_on_login_toggle)
+
+        self.start_hidden_switch = ToggleSwitch()
+        self.start_hidden_switch.setChecked(self.settings.start_hidden)
+        self.start_hidden_switch.toggled.connect(self._on_start_hidden_toggle)
 
         self.theme_combo = QtWidgets.QComboBox()
         self.theme_combo.addItem("System", "system")
@@ -231,7 +346,8 @@ class HyperxViewMixin:
         self.notify_switch.toggled.connect(self._on_notifications_toggle)
 
         prefs_layout.addRow("Active Headset", device_widget)
-        prefs_layout.addRow("Start in Systray", self.tray_switch)
+        prefs_layout.addRow("Start on Login", self.start_on_login_switch)
+        prefs_layout.addRow("Start Hidden (Tray)", self.start_hidden_switch)
         prefs_layout.addRow("Theme", self.theme_combo)
         prefs_layout.addRow("Tray Notifications", self.notify_switch)
         right_column.addWidget(prefs)
@@ -293,7 +409,13 @@ class HyperxViewMixin:
             on_color = "#19a79a"
             off_color = "#b5c8d9"
             knob = "#ffffff"
-        for switch in (self.voice_switch, self.mic_switch, self.tray_switch, self.notify_switch):
+        for switch in (
+            self.voice_switch,
+            self.mic_switch,
+            self.start_on_login_switch,
+            self.start_hidden_switch,
+            self.notify_switch,
+        ):
             switch.set_colors(on_color, off_color, knob)
 
     def _stylesheet(self, dark):
@@ -335,6 +457,11 @@ class HyperxViewMixin:
                 background-color: rgba(128, 80, 80, 0.22);
                 border-color: rgba(255, 178, 178, 0.45);
                 color: #ffd2d2;
+            }
+            QLabel#statusPill[state="busy"] {
+                background-color: rgba(196, 140, 53, 0.22);
+                border-color: rgba(255, 213, 137, 0.50);
+                color: #ffe3a8;
             }
             QLabel { color: #e7f0fb; }
             QGroupBox#card {
@@ -378,6 +505,7 @@ class HyperxViewMixin:
                 background-color: #58c7a2;
             }
             QProgressBar#batteryBar[state="disconnected"]::chunk { background-color: #64748b; }
+            QProgressBar#batteryBar[state="busy"]::chunk { background-color: #d4a44f; }
             QPushButton {
                 min-height: 34px;
                 border-radius: 9px;
@@ -435,6 +563,11 @@ class HyperxViewMixin:
                 border-color: rgba(191, 81, 81, 0.40);
                 color: #9d3a3a;
             }
+            QLabel#statusPill[state="busy"] {
+                background-color: rgba(191, 141, 43, 0.14);
+                border-color: rgba(191, 141, 43, 0.42);
+                color: #8a650f;
+            }
             QLabel { color: #1b3b5c; }
             QGroupBox#card {
                 background-color: #ffffff;
@@ -477,6 +610,7 @@ class HyperxViewMixin:
                 background-color: #20a17f;
             }
             QProgressBar#batteryBar[state="disconnected"]::chunk { background-color: #8ca0b4; }
+            QProgressBar#batteryBar[state="busy"]::chunk { background-color: #c79a3a; }
             QPushButton {
                 min-height: 34px;
                 border-radius: 9px;
@@ -530,25 +664,63 @@ class HyperxViewMixin:
         style.polish(widget)
         widget.update()
 
-    def _set_controls_enabled(self, enabled):
-        self.sleep_combo.setEnabled(enabled)
-        self.voice_switch.setEnabled(enabled)
-        self.mic_switch.setEnabled(enabled)
+    def _set_controls_enabled(
+        self,
+        enabled=None,
+        *,
+        sleep_enabled=None,
+        voice_enabled=None,
+        mic_enabled=None,
+    ):
+        if enabled is not None:
+            state = bool(enabled)
+            sleep_state = state
+            voice_state = state
+            mic_state = state
+        else:
+            sleep_state = (
+                bool(sleep_enabled)
+                if sleep_enabled is not None
+                else self.sleep_combo.isEnabled()
+            )
+            voice_state = (
+                bool(voice_enabled)
+                if voice_enabled is not None
+                else self.voice_switch.isEnabled()
+            )
+            mic_state = (
+                bool(mic_enabled)
+                if mic_enabled is not None
+                else self.mic_switch.isEnabled()
+            )
+        self.sleep_combo.setEnabled(sleep_state)
+        self.voice_switch.setEnabled(voice_state)
+        self.mic_switch.setEnabled(mic_state)
 
     def _set_status_text(self):
         connected = self.status == ConnectionStatus.CONNECTED
+        busy = bool(getattr(self, "_control_channel_busy", False))
         if connected and self.battery is not None:
             self.status_label.setText(f"Battery: {self.battery}%")
         elif connected:
             self.status_label.setText("Connected")
+        elif busy:
+            self.status_label.setText("Control Channel Busy")
         else:
             self.status_label.setText("Disconnected")
 
         if not hasattr(self, "connection_badge"):
             return
 
-        badge_state = "connected" if connected else "disconnected"
-        badge_text = "Connected" if connected else "Disconnected"
+        if connected:
+            badge_state = "connected"
+            badge_text = "Connected"
+        elif busy:
+            badge_state = "busy"
+            badge_text = "Busy"
+        else:
+            badge_state = "disconnected"
+            badge_text = "Disconnected"
         self.connection_badge.setText(badge_text)
         if self.connection_badge.property("state") != badge_state:
             self.connection_badge.setProperty("state", badge_state)
@@ -563,6 +735,11 @@ class HyperxViewMixin:
             self.battery_progress.setValue(self.battery)
         elif connected:
             self.battery_summary_label.setText("Reading headset battery...")
+            self.battery_progress.setValue(0)
+        elif busy:
+            self.battery_summary_label.setText(
+                "Headset detected, but telemetry is busy (Discord/game may be using it)."
+            )
             self.battery_progress.setValue(0)
         else:
             self.battery_summary_label.setText("Headset powered off")

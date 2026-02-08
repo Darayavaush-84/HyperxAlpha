@@ -1,4 +1,5 @@
 import os
+import queue
 import sys
 import threading
 import time
@@ -27,6 +28,29 @@ DEVICE_HOTPLUG_INTERVAL_MS = 2500
 CONNECTION_NOTIFY_DEBOUNCE_MS = 1800
 BATTERY_NOTIFY_DEBOUNCE_MS = 1800
 TRANSIENT_TX_FAILURE_LIMIT = 2
+TX_TIMEOUT_BACKOFF_INITIAL_MS = 4000
+TX_TIMEOUT_BACKOFF_MAX_MS = 60000
+TX_QUEUE_MAX_PENDING = 64
+LOG_DIALOG_FLUSH_INTERVAL_MS = 120
+TX_TIMEOUT_LOG_MIN_INTERVAL_SECONDS = 20.0
+TX_QUEUE_FULL_LOG_MIN_INTERVAL_SECONDS = 4.0
+LOG_LEVEL_INFO = "INFO"
+LOG_LEVEL_WARN = "WARN"
+LOG_LEVEL_DEBUG = "DEBUG"
+LOG_LEVELS = (LOG_LEVEL_INFO, LOG_LEVEL_WARN, LOG_LEVEL_DEBUG)
+TX_TIMEOUT_ERROR_MARKERS = (
+    "timeout",
+    "timed out",
+    "connection timed out",
+    "operation timed out",
+    "resource temporarily unavailable",
+    "would block",
+    "resource busy",
+)
+
+
+class DeviceTxSignals(QtCore.QObject):
+    completed = QtCore.Signal(int, str, bool, bool, str)
 
 
 class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
@@ -58,6 +82,15 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
         self._last_open_error = None
         self._last_io_error = None
         self._transient_tx_failures = 0
+        self._tx_timeout_backoff_ms = 0
+        self._tx_suspended_until = 0.0
+        self._control_channel_busy = False
+        self._tx_session_id = 0
+        self._tx_queue = queue.Queue(maxsize=TX_QUEUE_MAX_PENDING)
+        self._tx_worker_stop = threading.Event()
+        self._tx_worker = None
+        self._tx_signals = DeviceTxSignals(self)
+        self._tx_signals.completed.connect(self._on_tx_command_completed)
         self._poll_timer = QtCore.QTimer(self)
         self._poll_timer.setInterval(POLL_INTERVAL_DISCONNECTED_MS)
         self._poll_timer.timeout.connect(self._poll_headset)
@@ -110,9 +143,17 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
         self._battery_notification_cooldown_seconds = 900.0
         self._battery_notification_last_sent = {}
 
-        self._log_buffer = []
         self._log_buffer_max = 1000
+        self._log_entries = deque(maxlen=self._log_buffer_max)
         self._log_dialog = None
+        self._log_pending_entries = deque()
+        self._log_dialog_snapshot_needed = False
+        self._log_flush_timer = QtCore.QTimer(self)
+        self._log_flush_timer.setSingleShot(True)
+        self._log_flush_timer.setInterval(LOG_DIALOG_FLUSH_INTERVAL_MS)
+        self._log_flush_timer.timeout.connect(self._flush_log_dialog_updates)
+        self._repeating_log_state = {}
+        self._timeout_tx_failures = 0
         self._verbose_io_logs = os.environ.get("HYPERX_DEBUG_IO", "0") == "1"
         self._stdout_logs = os.environ.get("HYPERX_LOG_STDOUT", "0") == "1"
 
@@ -130,10 +171,12 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
         }
 
         self.settings = self._settings_service.load()
-        if self._settings_service.autostart_enabled() and not self.settings.start_in_tray:
-            self.settings.start_in_tray = True
+        autostart_active = self._settings_service.autostart_enabled()
+        if self.settings.start_on_login != autostart_active:
+            self.settings.start_on_login = autostart_active
             self._settings_service.save(self.settings)
 
+        self._start_tx_worker()
         self._build_ui()
         self._refresh_device_list(preferred_key=self.settings.selected_device_key)
         self._apply_selected_device(reconnect=False)
@@ -152,44 +195,268 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
 
         QtCore.QTimer.singleShot(0, self._start_device_open)
 
-    def _log(self, message):
+    @staticmethod
+    def _normalize_log_level(level):
+        normalized = str(level or LOG_LEVEL_INFO).strip().upper()
+        if normalized in LOG_LEVELS:
+            return normalized
+        return LOG_LEVEL_INFO
+
+    @staticmethod
+    def _emit_log(target, message, level=LOG_LEVEL_INFO):
+        log_fn = getattr(target, "_log", None)
+        if log_fn is None:
+            return
+        try:
+            log_fn(message, level=level)
+        except TypeError:
+            log_fn(message)
+
+    def _log(self, message, level=LOG_LEVEL_INFO):
+        level = self._normalize_log_level(level)
+        text = str(message)
         timestamp = datetime.now().strftime("%H:%M:%S")
-        line = f"[{timestamp}] {message}"
-        self._log_buffer.append(line)
+        line = f"[{timestamp}] [{level}] {text}"
+        buffer_was_full = len(self._log_entries) >= self._log_buffer_max
+        self._log_entries.append(
+            {
+                "timestamp": timestamp,
+                "level": level,
+                "message": text,
+            }
+        )
         if self._stdout_logs:
             print(line, flush=True)
-        trimmed = False
-        if len(self._log_buffer) > self._log_buffer_max:
-            self._log_buffer = self._log_buffer[-self._log_buffer_max :]
-            trimmed = True
         if self._log_dialog is not None:
-            if trimmed:
-                self._log_dialog.set_text("\n".join(self._log_buffer))
+            if buffer_was_full:
+                self._log_dialog_snapshot_needed = True
             else:
-                self._log_dialog.append_line(line)
+                self._log_pending_entries.append(
+                    {
+                        "timestamp": timestamp,
+                        "level": level,
+                        "message": text,
+                    }
+                )
+            if not self._log_flush_timer.isActive():
+                self._log_flush_timer.start()
+
+    def _flush_log_dialog_updates(self):
+        if self._log_dialog is None:
+            self._log_pending_entries.clear()
+            self._log_dialog_snapshot_needed = False
+            return
+        if self._log_dialog_snapshot_needed:
+            self._log_dialog_snapshot_needed = False
+            self._log_pending_entries.clear()
+            self._log_dialog.set_entries(list(self._log_entries))
+            return
+        if not self._log_pending_entries:
+            return
+        entries = list(self._log_pending_entries)
+        self._log_pending_entries.clear()
+        self._log_dialog.append_entries(entries)
+
+    def _consume_repeating_log_suppressed(self, key):
+        state = self._repeating_log_state.get(str(key))
+        if state is None:
+            return 0
+        suppressed = int(state.get("suppressed", 0))
+        state["suppressed"] = 0
+        state["last_emit"] = 0.0
+        return suppressed
+
+    def _log_repeating(
+        self,
+        key,
+        message,
+        min_interval_seconds,
+        level=LOG_LEVEL_INFO,
+    ):
+        key = str(key)
+        now = time.monotonic()
+        state = self._repeating_log_state.setdefault(
+            key,
+            {"last_emit": 0.0, "suppressed": 0},
+        )
+        last_emit = float(state.get("last_emit", 0.0))
+        min_interval_seconds = max(0.0, float(min_interval_seconds))
+        if last_emit <= 0.0 or now - last_emit >= min_interval_seconds:
+            suppressed = int(state.get("suppressed", 0))
+            if suppressed > 0:
+                HyperxWindow._emit_log(
+                    self,
+                    f"{message} (suppressed {suppressed} similar events)",
+                    level=level,
+                )
+            else:
+                HyperxWindow._emit_log(self, message, level=level)
+            state["last_emit"] = now
+            state["suppressed"] = 0
+            return True
+        state["suppressed"] = int(state.get("suppressed", 0)) + 1
+        return False
 
     def _format_packet(self, data):
         return " ".join(f"{byte:02X}" for byte in data)
 
-    def _send_command(self, cmd, label=None, allow_transient_failure=False):
-        command_value = int(cmd)
-        command_name = getattr(cmd, "name", None) or label or f"CMD_0x{command_value:08X}"
-        if not self._device_ready:
-            if self._verbose_io_logs:
-                self._log(f"TX skipped (device not ready): {command_name}")
-            return False
-        if self._verbose_io_logs:
-            self._log(f"TX {command_name} (0x{command_value:08X})")
+    def _start_tx_worker(self):
+        worker = self._tx_worker
+        if worker is not None and worker.is_alive():
+            return
+        self._tx_worker_stop.clear()
+        self._tx_worker = threading.Thread(
+            target=self._tx_worker_loop,
+            daemon=True,
+            name="hyperxalpha-device-tx",
+        )
+        self._tx_worker.start()
+
+    def _stop_tx_worker(self):
+        worker = self._tx_worker
+        if worker is None:
+            return
+        self._tx_worker_stop.set()
         try:
-            sent = self._device_service.send_command(cmd)
-        except HidIoError as exc:
-            message = f"TX {command_name} failed: {exc}"
-            if allow_transient_failure:
-                self._transient_tx_failures += 1
-                self._log(
-                    "Device I/O transient error "
-                    f"({self._transient_tx_failures}/{TRANSIENT_TX_FAILURE_LIMIT}): {message}"
-                )
+            self._tx_queue.put_nowait(None)
+        except queue.Full:
+            self._drain_tx_queue()
+            try:
+                self._tx_queue.put_nowait(None)
+            except queue.Full:
+                pass
+        if worker.is_alive():
+            worker.join(0.2)
+        self._tx_worker = None
+
+    def _drain_tx_queue(self):
+        queue_ref = getattr(self, "_tx_queue", None)
+        if queue_ref is None:
+            return
+        while True:
+            try:
+                queue_ref.get_nowait()
+            except queue.Empty:
+                return
+
+    def _invalidate_tx_session(self):
+        self._tx_session_id += 1
+        self._drain_tx_queue()
+
+    def _tx_worker_loop(self):
+        while not self._tx_worker_stop.is_set():
+            try:
+                item = self._tx_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if item is None:
+                break
+            session_id, cmd, command_name, allow_transient_failure = item
+            sent = False
+            error_message = ""
+            try:
+                sent = bool(self._device_service.send_command(cmd))
+            except HidIoError as exc:
+                error_message = str(exc)
+            except Exception as exc:
+                error_message = f"Unexpected send error: {exc}"
+            self._tx_signals.completed.emit(
+                int(session_id),
+                str(command_name),
+                bool(allow_transient_failure),
+                bool(sent),
+                str(error_message),
+            )
+
+    @staticmethod
+    def _is_timeout_io_error(error):
+        text = str(error).strip().lower()
+        if not text:
+            return False
+        return any(marker in text for marker in TX_TIMEOUT_ERROR_MARKERS)
+
+    def _record_transient_tx_failure(self, message):
+        self._transient_tx_failures += 1
+        HyperxWindow._emit_log(
+            self,
+            "Device I/O transient error "
+            f"({self._transient_tx_failures} consecutive, "
+            f"threshold {TRANSIENT_TX_FAILURE_LIMIT}): {message}",
+            level=LOG_LEVEL_DEBUG,
+        )
+
+    def _set_control_channel_busy(self, busy):
+        busy = bool(busy)
+        if self._control_channel_busy == busy:
+            return
+        self._control_channel_busy = busy
+        self._sync_control_availability()
+        self._set_status_text()
+        self._update_tray_icon()
+
+    def _clear_tx_timeout_backoff(self):
+        suppressed = self._consume_repeating_log_suppressed("tx-timeout")
+        was_busy = (
+            self._control_channel_busy
+            or self._tx_timeout_backoff_ms > 0
+            or self._timeout_tx_failures > 0
+        )
+        self._tx_timeout_backoff_ms = 0
+        self._tx_suspended_until = 0.0
+        self._timeout_tx_failures = 0
+        self._set_control_channel_busy(False)
+        if was_busy and suppressed > 0:
+            self._log(
+                "Control channel recovered "
+                f"(suppressed {suppressed} similar timeout events)."
+            )
+
+    def _apply_tx_timeout_backoff(self, command_name):
+        if self._tx_timeout_backoff_ms <= 0:
+            next_backoff_ms = TX_TIMEOUT_BACKOFF_INITIAL_MS
+        else:
+            next_backoff_ms = min(
+                self._tx_timeout_backoff_ms * 2,
+                TX_TIMEOUT_BACKOFF_MAX_MS,
+            )
+        self._tx_timeout_backoff_ms = int(next_backoff_ms)
+        self._tx_suspended_until = (
+            time.monotonic() + (float(self._tx_timeout_backoff_ms) / 1000.0)
+        )
+        self._set_control_channel_busy(True)
+        return max(1, self._tx_timeout_backoff_ms // 1000)
+
+    def _record_timeout_tx_failure(self, command_name, message):
+        self._timeout_tx_failures += 1
+        backoff_seconds = self._apply_tx_timeout_backoff(command_name)
+        self._log_repeating(
+            "tx-timeout",
+            "Device I/O transient error "
+            f"(timeout #{self._timeout_tx_failures}): {message}; "
+            "control channel busy, "
+            f"pausing telemetry polling for {backoff_seconds}s "
+            f"(last command: {command_name}).",
+            TX_TIMEOUT_LOG_MIN_INTERVAL_SECONDS,
+            level=LOG_LEVEL_DEBUG,
+        )
+
+    def _process_tx_result(
+        self,
+        command_name,
+        allow_transient_failure,
+        *,
+        sent,
+        io_error=None,
+    ):
+        if io_error:
+            message = f"TX {command_name} failed: {io_error}"
+            timeout_error = HyperxWindow._is_timeout_io_error(io_error)
+            if allow_transient_failure or timeout_error:
+                if timeout_error:
+                    self._transient_tx_failures = 0
+                    self._record_timeout_tx_failure(command_name, message)
+                    return False
+                self._record_transient_tx_failure(message)
                 if self._transient_tx_failures >= TRANSIENT_TX_FAILURE_LIMIT:
                     self._transient_tx_failures = 0
                     self._handle_device_io_error(message)
@@ -197,37 +464,136 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
                 self._transient_tx_failures = 0
                 self._handle_device_io_error(message)
             return False
+
         if sent:
             self._transient_tx_failures = 0
+            self._clear_tx_timeout_backoff()
             return True
+
+        message = f"TX {command_name} failed: device handle unavailable."
         if allow_transient_failure:
-            self._transient_tx_failures += 1
-            self._log(
-                "Device I/O transient error "
-                f"({self._transient_tx_failures}/{TRANSIENT_TX_FAILURE_LIMIT}): "
-                f"TX {command_name} failed: device handle unavailable."
-            )
+            self._record_transient_tx_failure(message)
             if self._transient_tx_failures >= TRANSIENT_TX_FAILURE_LIMIT:
                 self._transient_tx_failures = 0
-                self._handle_device_io_error(
-                    f"TX {command_name} failed: device handle unavailable."
+                self._handle_device_io_error(message)
+            return False
+
+        self._transient_tx_failures = 0
+        self._handle_device_io_error(message)
+        return False
+
+    def _send_command_sync(self, cmd, command_name, allow_transient_failure):
+        try:
+            sent = self._device_service.send_command(cmd)
+        except HidIoError as exc:
+            return HyperxWindow._process_tx_result(
+                self,
+                command_name,
+                allow_transient_failure,
+                sent=False,
+                io_error=str(exc),
+            )
+        except Exception as exc:
+            return HyperxWindow._process_tx_result(
+                self,
+                command_name,
+                allow_transient_failure,
+                sent=False,
+                io_error=f"Unexpected send error: {exc}",
+            )
+        return HyperxWindow._process_tx_result(
+            self,
+            command_name,
+            allow_transient_failure,
+            sent=bool(sent),
+            io_error=None,
+        )
+
+    def _on_tx_command_completed(
+        self,
+        session_id,
+        command_name,
+        allow_transient_failure,
+        sent,
+        error_message,
+    ):
+        if self._shutting_down:
+            return
+        if int(session_id) != int(self._tx_session_id):
+            return
+        HyperxWindow._process_tx_result(
+            self,
+            command_name,
+            bool(allow_transient_failure),
+            sent=bool(sent),
+            io_error=(str(error_message) or None),
+        )
+
+    def _send_command(self, cmd, label=None, allow_transient_failure=False):
+        command_value = int(cmd)
+        command_name = getattr(cmd, "name", None) or label or f"CMD_0x{command_value:08X}"
+        if not self._device_ready:
+            if self._verbose_io_logs:
+                HyperxWindow._emit_log(
+                    self,
+                    f"TX skipped (device not ready): {command_name}",
+                    level=LOG_LEVEL_DEBUG,
                 )
             return False
-        self._transient_tx_failures = 0
-        self._handle_device_io_error(
-            f"TX {command_name} failed: device handle unavailable."
-        )
-        return False
+        if self._tx_suspended_until > 0.0 and time.monotonic() < self._tx_suspended_until:
+            if self._verbose_io_logs:
+                HyperxWindow._emit_log(
+                    self,
+                    f"TX skipped (control channel busy): {command_name}",
+                    level=LOG_LEVEL_DEBUG,
+                )
+            return False
+        if self._verbose_io_logs:
+            HyperxWindow._emit_log(
+                self,
+                f"TX {command_name} (0x{command_value:08X})",
+                level=LOG_LEVEL_DEBUG,
+            )
+
+        tx_queue = getattr(self, "_tx_queue", None)
+        if tx_queue is None:
+            return HyperxWindow._send_command_sync(
+                self,
+                cmd,
+                command_name,
+                bool(allow_transient_failure),
+            )
+        try:
+            tx_queue.put_nowait(
+                (
+                    int(self._tx_session_id),
+                    cmd,
+                    command_name,
+                    bool(allow_transient_failure),
+                )
+            )
+            return True
+        except queue.Full:
+            self._log_repeating(
+                "tx-queue-full",
+                f"TX queue full, dropping command: {command_name}",
+                TX_QUEUE_FULL_LOG_MIN_INTERVAL_SECONDS,
+                level=LOG_LEVEL_WARN,
+            )
+            return False
 
     def _show_logs(self):
         if self._log_dialog is None:
             self._log_dialog = LogDialog(self)
-        self._log_dialog.set_text("\n".join(self._log_buffer))
+        self._log_flush_timer.stop()
+        self._log_pending_entries.clear()
+        self._log_dialog_snapshot_needed = False
+        self._log_dialog.set_entries(list(self._log_entries))
         self._log_dialog.show()
         self._log_dialog.raise_()
 
     def _show_error(self, title, message):
-        self._log(f"Error: {message}")
+        HyperxWindow._emit_log(self, f"Error: {message}", level=LOG_LEVEL_WARN)
         QtWidgets.QMessageBox.critical(self, title, message)
 
     def _on_scan_devices(self):
@@ -254,11 +620,19 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
             return devices, None
         except HidUnavailable as exc:
             if log_failures:
-                self._log(f"Device scan failed: {exc}")
+                HyperxWindow._emit_log(
+                    self,
+                    f"Device scan failed: {exc}",
+                    level=LOG_LEVEL_WARN,
+                )
             return [], str(exc)
         except (OSError, RuntimeError, ValueError) as exc:
             if log_failures:
-                self._log(f"Device scan failed unexpectedly: {exc}")
+                HyperxWindow._emit_log(
+                    self,
+                    f"Device scan failed unexpectedly: {exc}",
+                    level=LOG_LEVEL_WARN,
+                )
             return [], str(exc)
 
     def _populate_device_list(self, devices, preferred_key=None):
@@ -313,11 +687,19 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
         if error is not None:
             if error != self._last_device_scan_error:
                 self._last_device_scan_error = error
-                self._log(f"Hotplug scan unavailable: {error}")
+                HyperxWindow._emit_log(
+                    self,
+                    f"Hotplug scan unavailable: {error}",
+                    level=LOG_LEVEL_WARN,
+                )
             return
         if self._last_device_scan_error is not None:
             self._last_device_scan_error = None
-            self._log("Hotplug scan restored.")
+            HyperxWindow._emit_log(
+                self,
+                "Hotplug scan restored.",
+                level=LOG_LEVEL_INFO,
+            )
 
         signature = self._device_signature(devices)
         if signature == self._last_device_signature:
@@ -367,6 +749,7 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
     def _restart_device_connection(self, reason=None):
         if reason:
             self._log(reason)
+        self._invalidate_tx_session()
         self._device_ready = False
         self._stop_reader()
         self._device_service.close()
@@ -416,9 +799,11 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
             self._device_service.close()
             return
         self._device_ready = True
+        self._sync_control_availability()
         self._last_open_error = None
         self._last_io_error = None
         self._transient_tx_failures = 0
+        self._clear_tx_timeout_backoff()
         self._open_retry_timer.stop()
         self._log("Device opened.")
         self._reader = DeviceReader(
@@ -437,11 +822,16 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
         self._opener_thread = None
         if self._shutting_down or generation != self._open_generation:
             return
+        self._invalidate_tx_session()
         self._device_ready = False
         self._apply_disconnected_state()
         if message != self._last_open_error:
             self._last_open_error = message
-            self._log(f"Device unavailable: {message}")
+            HyperxWindow._emit_log(
+                self,
+                f"Device unavailable: {message}",
+                level=LOG_LEVEL_WARN,
+            )
         if not self._open_retry_timer.isActive():
             self._open_retry_timer.start()
 
@@ -453,8 +843,14 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
             return
         if message != self._last_io_error:
             self._last_io_error = message
-            self._log(f"Device I/O error: {message}")
+            HyperxWindow._emit_log(
+                self,
+                f"Device I/O error: {message}",
+                level=LOG_LEVEL_WARN,
+            )
+        self._invalidate_tx_session()
         self._transient_tx_failures = 0
+        self._clear_tx_timeout_backoff()
         self._device_ready = False
         self._stop_reader()
         self._device_service.close()
@@ -509,13 +905,55 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
         self._set_tray_quick_controls_enabled(False)
         self._sync_tray_quick_controls_from_ui()
 
-    def _set_tray_quick_controls_enabled(self, enabled):
-        enabled = bool(enabled)
-        for action in (self._tray_voice_action, self._tray_mic_action):
-            if action is not None:
-                action.setEnabled(enabled)
+    def _set_tray_quick_controls_enabled(
+        self,
+        enabled=None,
+        *,
+        voice_enabled=None,
+        mic_enabled=None,
+        sleep_enabled=None,
+    ):
+        if enabled is not None:
+            voice_state = bool(enabled)
+            mic_state = bool(enabled)
+            sleep_state = bool(enabled)
+        else:
+            voice_state = bool(voice_enabled)
+            mic_state = bool(mic_enabled)
+            sleep_state = bool(sleep_enabled)
+
+        if self._tray_voice_action is not None:
+            self._tray_voice_action.setEnabled(voice_state)
+        if self._tray_mic_action is not None:
+            self._tray_mic_action.setEnabled(mic_state)
         for action in self._tray_sleep_actions.values():
-            action.setEnabled(enabled)
+            action.setEnabled(sleep_state)
+
+    def _can_use_realtime_controls(self):
+        return bool(
+            self._device_ready
+            and self.status == ConnectionStatus.CONNECTED
+        )
+
+    def _can_use_sleep_controls(self):
+        return bool(
+            self._device_ready
+            and self.status == ConnectionStatus.CONNECTED
+        )
+
+    def _sync_control_availability(self):
+        realtime_enabled = self._can_use_realtime_controls()
+        sleep_enabled = self._can_use_sleep_controls()
+        self._set_controls_enabled(
+            sleep_enabled=sleep_enabled,
+            voice_enabled=realtime_enabled,
+            mic_enabled=realtime_enabled,
+        )
+        self._set_tray_quick_controls_enabled(
+            voice_enabled=realtime_enabled,
+            mic_enabled=realtime_enabled,
+            sleep_enabled=sleep_enabled,
+        )
 
     def _sync_tray_quick_controls_from_ui(self):
         if self._tray is None:
@@ -535,7 +973,7 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
     def _on_tray_voice_action_toggled(self, active):
         if self._updating_tray_controls:
             return
-        if self.status != ConnectionStatus.CONNECTED or not self._device_ready:
+        if not self._can_use_realtime_controls():
             self._sync_tray_quick_controls_from_ui()
             return
         self._updating_controls = True
@@ -546,7 +984,7 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
     def _on_tray_mic_action_toggled(self, active):
         if self._updating_tray_controls:
             return
-        if self.status != ConnectionStatus.CONNECTED or not self._device_ready:
+        if not self._can_use_realtime_controls():
             self._sync_tray_quick_controls_from_ui()
             return
         self._updating_controls = True
@@ -557,7 +995,7 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
     def _on_tray_sleep_selected(self, index, checked):
         if self._updating_tray_controls or not checked:
             return
-        if self.status != ConnectionStatus.CONNECTED or not self._device_ready:
+        if not self._can_use_sleep_controls():
             self._sync_tray_quick_controls_from_ui()
             return
         if index not in (0, 1, 2):
@@ -618,28 +1056,62 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
         self.hide()
         self._update_tray_menu_label()
 
-    def _on_tray_toggle(self, _checked):
+    def _on_start_on_login_toggle(self, _checked):
         if self._updating_settings:
             return
-        previous = bool(self.settings.start_in_tray)
-        enabled = self.tray_switch.isChecked()
+        previous = bool(self.settings.start_on_login)
+        enabled = self.start_on_login_switch.isChecked()
         if enabled == previous:
             return
-        self.settings.start_in_tray = enabled
+        self.settings.start_on_login = enabled
         if not self._settings_service.save(self.settings):
-            self.settings.start_in_tray = previous
+            self.settings.start_on_login = previous
             self._updating_settings = True
-            self.tray_switch.setChecked(previous)
+            self.start_on_login_switch.setChecked(previous)
             self._updating_settings = False
             self._show_error("Settings Error", "Unable to save preferences.")
             return
-        if not self._settings_service.set_autostart(enabled):
+        if not self._settings_service.set_autostart(
+            enabled,
+            start_hidden=self.settings.start_hidden,
+        ):
             self._updating_settings = True
-            self.tray_switch.setChecked(previous)
+            self.start_on_login_switch.setChecked(previous)
             self._updating_settings = False
-            self.settings.start_in_tray = previous
+            self.settings.start_on_login = previous
             if not self._settings_service.save(self.settings):
-                self._log("Unable to roll back start-in-tray setting after autostart error.")
+                self._log("Unable to roll back start-on-login setting after autostart error.")
+            self._show_error("Autostart Error", "Unable to update autostart entry.")
+
+    def _on_start_hidden_toggle(self, _checked):
+        if self._updating_settings:
+            return
+        previous = bool(self.settings.start_hidden)
+        enabled = self.start_hidden_switch.isChecked()
+        if enabled == previous:
+            return
+        self.settings.start_hidden = enabled
+        if not self._settings_service.save(self.settings):
+            self.settings.start_hidden = previous
+            self._updating_settings = True
+            self.start_hidden_switch.setChecked(previous)
+            self._updating_settings = False
+            self._show_error("Settings Error", "Unable to save preferences.")
+            return
+        if not self.settings.start_on_login:
+            return
+        if not self._settings_service.set_autostart(
+            True,
+            start_hidden=enabled,
+        ):
+            self._updating_settings = True
+            self.start_hidden_switch.setChecked(previous)
+            self._updating_settings = False
+            self.settings.start_hidden = previous
+            if not self._settings_service.save(self.settings):
+                self._log(
+                    "Unable to roll back start-hidden setting after autostart update error."
+                )
             self._show_error("Autostart Error", "Unable to update autostart entry.")
 
     def _on_theme_changed(self, _index):
@@ -971,6 +1443,8 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
         self._tray.setToolTip(self._tray_tooltip())
 
     def _tray_tooltip(self):
+        if self._control_channel_busy and self._device_ready:
+            return "Headset detected (control channel busy)"
         if self.status == ConnectionStatus.CONNECTED:
             if self.battery is None:
                 return "Connected"
@@ -988,8 +1462,8 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
     ):
         was_disconnected = self.status == ConnectionStatus.DISCONNECTED
         self.status = ConnectionStatus.DISCONNECTED
-        self._set_controls_enabled(False)
-        self._set_tray_quick_controls_enabled(False)
+        self._set_control_channel_busy(False)
+        self._sync_control_availability()
         self._set_status_text()
         self._update_tray_icon()
         if log_status_change and not was_disconnected:
@@ -1011,8 +1485,7 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
         was_connected = self.status == ConnectionStatus.CONNECTED
         self.status = ConnectionStatus.CONNECTED
         self._mic_state_reported = False
-        self._set_controls_enabled(True)
-        self._set_tray_quick_controls_enabled(True)
+        self._sync_control_availability()
         self._sync_tray_quick_controls_from_ui()
         self._set_status_text()
         self._update_tray_icon()
@@ -1088,13 +1561,18 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
 
     def _handle_packet(self, data):
         if self._verbose_io_logs:
-            self._log(f"RX {self._format_packet(data)}")
+            HyperxWindow._emit_log(
+                self,
+                f"RX {self._format_packet(data)}",
+                level=LOG_LEVEL_DEBUG,
+            )
         if len(data) < 4:
             return
         if data[0] != 0x21 or data[1] != 0xBB:
             return
 
         self._transient_tx_failures = 0
+        self._clear_tx_timeout_backoff()
         code = data[2]
         value = data[3]
         handler = self._packet_handlers.get(code)
@@ -1105,14 +1583,17 @@ class HyperxWindow(HyperxViewMixin, QtWidgets.QWidget):
         if self._shutting_down:
             return
         self._shutting_down = True
+        self._invalidate_tx_session()
         self._poll_timer.stop()
         self._device_hotplug_timer.stop()
         self._mic_state_probe_timer.stop()
         self._open_retry_timer.stop()
+        self._log_flush_timer.stop()
         self._clear_pending_connection_notifications()
         self._clear_pending_battery_notifications()
         self._stop_reader()
         self._stop_opener()
+        self._stop_tx_worker()
         self._device_service.close()
         if self._tray is not None:
             self._tray.hide()
